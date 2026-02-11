@@ -4,6 +4,9 @@ import { legacyFetch } from "./legacy/legacyFetch";
 
 import { handleBlocksProxy } from "./routes/blocksProxy";
 import { handleHealth, handleVersion } from "./routes/health";
+import { routeAuth } from "./routes/auth";
+import { routePublic } from "./routes/public";
+import { routeTelegram } from "./routes/telegram";
 import { enforceSameOriginForMutations } from "./middleware/security";
 
 import { routeMiniApi } from "./routes/mini";
@@ -46,6 +49,19 @@ if (url.pathname.startsWith("/api/mini/")) {
         const csrf = enforceSameOriginForMutations(request);
         if (csrf) return withCors(request, csrf);
       }
+
+      
+      // Auth API (cabinet)
+      const authResp = await routeAuth(request, env, url);
+      if (authResp) return withCors(request, authResp);
+
+      // Public API (events, stars, sales token)
+      const pubResp = await routePublic(request, env, url);
+      if (pubResp) return withCors(request, pubResp);
+
+      // Telegram webhook
+      const tgResp = await routeTelegram(request, env, url);
+      if (tgResp) return withCors(request, tgResp);
 
       // Blocks proxy (fast path)
       if (url.pathname.startsWith("/blocks/")) {
