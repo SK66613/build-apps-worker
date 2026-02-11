@@ -4072,7 +4072,7 @@ async function refsTotal(db, appPublicId, referrerTgId){
 
 
 // ===================== HTTP endpoints =====================
-async function handleMiniApi(request, env, url){
+export async function handleMiniApi(request, env, url){
   const db = env.DB;
   const publicId = url.searchParams.get('public_id') || url.pathname.split('/').pop();
 
