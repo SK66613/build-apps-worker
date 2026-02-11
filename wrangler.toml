@@ -5,7 +5,7 @@ compatibility_date = "2025-02-01"
 
 [vars]
 GITHUB_SHA = ""
-
+DEBUG_ERRORS = "1" # поставь "1" временно, чтобы в ответе /api/* приходил stack
 
 [observability]
 enabled = true
