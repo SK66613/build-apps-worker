@@ -6,6 +6,8 @@ import { handleBlocksProxy } from "./routes/blocksProxy";
 import { handleHealth, handleVersion } from "./routes/health";
 import { enforceSameOriginForMutations } from "./middleware/security";
 
+import { routeMiniApi } from "./routes/mini";
+
 export interface Env {
   DB: D1Database;
   APPS: KVNamespace;
@@ -24,6 +26,15 @@ export default {
       if (request.method === "OPTIONS") return handleOptions(request);
 
       const url = new URL(request.url);
+
+      // Mini API (published mini-app runtime)
+// Важно: раньше legacy, чтобы legacy вообще не касался /api/mini/*
+if (url.pathname.startsWith("/api/mini/")) {
+  // CSRF allowlist уже проверяется выше (у тебя стоит на /api/*)
+  const r = await routeMiniApi(request, env, url);
+  return withCors(request, r);
+}
+
 
       // Health / Version
       if (url.pathname === "/_health") return withCors(request, handleHealth());
