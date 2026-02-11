@@ -1,0 +1,16 @@
+name = "build-apps"
+main = "src/index.ts"
+compatibility_date = "2025-02-01"
+
+# ===== Bindings (заполни IDs) =====
+[[d1_databases]]
+binding = "DB"
+database_id = "PASTE_D1_DATABASE_ID"
+
+[[kv_namespaces]]
+binding = "APPS"
+id = "PASTE_KV_APPS_ID"
+
+[[kv_namespaces]]
+binding = "BOT_SECRETS"
+id = "PASTE_KV_BOT_SECRETS_ID"
