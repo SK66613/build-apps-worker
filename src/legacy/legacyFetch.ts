@@ -9,8 +9,9 @@ export async function legacyFetch(request: Request, env: any, ctx: ExecutionCont
     const pathname = url.pathname;
 
     try {
+      // OPTIONS обрабатывается в src/index.ts (handleOptions).
       if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: legacyCorsHeaders(request) });
+        return new Response(null, { status: 204 });
       }
 
       // AUTH
@@ -917,37 +918,14 @@ function getSeedConfig(templateId) {
 }
 
 
-// ================== HELPERS: CORS / JSON ==================
-// ВАЖНО: corsHeaders должен существовать в той же области видимости, где вызывается json().
-// Поэтому держим всё рядом и без "const corsHeaders = ..." (чтобы не поймать TDZ/ReferenceError при бандлинге).
+// ================== LEGACY HELPERS: JSON ==================
+// ВАЖНО: CORS НЕ делаем внутри legacy.
+// CORS навешивается только один раз в src/index.ts через withCors().
+// Это убирает вечные TDZ/ReferenceError после бандлинга.
 
-const LEGACY_CORS_ALLOW = new Set([
-  "https://app.salesgenius.ru",
-  "https://mini.salesgenius.ru",
-  "https://blocks.salesgenius.ru",   // CDN с блоками (Pages/GH Pages)
-  "https://ru.salesgenius.ru",
-  'https://apps.salesgenius.ru',       // GH Pages (RU зеркало)
-  // Telegram WebApp (desktop / mobile)
-  "https://web.telegram.org",
-  "https://web.telegram.org/k",
-  "https://web.telegram.org/z",
-  
-]);
-
-
-function legacyCorsHeaders(request) {
-  const origin = request?.headers?.get("Origin") || "";
-  if (!origin) return { "Vary": "Origin" }; // нет Origin — не CORS
-
-  if (!LEGACY_CORS_ALLOW.has(origin)) return { "Vary": "Origin" };
-
-  return {
-    "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "Content-Type, Authorization",
-    "Vary": "Origin",
-  };
+function legacyCorsHeaders(_request: any) {
+  // оставляем только Vary, чтобы не ломать существующие вызовы
+  return { "Vary": "Origin" };
 }
 
 
@@ -956,6 +934,7 @@ function json(obj, status = 200, request = null) {
     status,
     headers: {
       "Content-Type": "application/json; charset=UTF-8",
+      // legacyCorsHeaders() теперь безопасен и не делает allowlist
       ...legacyCorsHeaders(request),
     },
   });
@@ -966,179 +945,9 @@ function json(obj, status = 200, request = null) {
 
 
 
-// ================== BLOCKS PROXY (/blocks/*) ==================
-
-const BLOCKS_UPSTREAMS = [
-  // ЕДИНСТВЕННЫЙ корректный апстрим для блоков/манифестов
-  'https://blocks.salesgenius.ru/sg-blocks/'
-];
-
-// ВРЕМЕННО: выключаем кэш для /blocks/*
-const BLOCKS_CACHE_DISABLED = true;
-
-// небольшая подмога: пробуем несколько апстримов по очереди
-// (сейчас фактически 1, но оставляем цикл на будущее)
-async function fetchFromUpstreams(pathRel, request) {
-  let lastErr = null;
-
-  // нормализуем относительный путь
-  const rel = String(pathRel || '').replace(/^\//, '');
-
-  // манифесты не кэшируем надолго — иначе “прыгают версии / не обновляется”
-  const isManifest =
-    rel.endsWith('index.json') ||
-    rel.includes('/index.json') ||
-    rel.endsWith('manifest.json') ||
-    rel.includes('/manifest.json');
-
-  // TTL: манифест короткий, ассеты — длинный
-  const EDGE_TTL_OK = isManifest ? 60 : 86400;      // edge cache
-  const BROWSER_TTL_OK = isManifest ? 60 : 86400;   // Cache-Control для клиента
-
-  for (const base of BLOCKS_UPSTREAMS) {
-    try {
-      const u = new URL(rel, base);
-
-      // Edge cache key (только GET)
-      const cacheKey = new Request(u.toString(), { method: 'GET' });
-      const cache = caches.default;
-
-      // 1) try cache (только если кэш НЕ отключён)
-      if (!BLOCKS_CACHE_DISABLED) {
-        const cached = await cache.match(cacheKey);
-        if (cached) {
-          // добавим диагностику, чтобы ты в DevTools видел что пришло из кэша
-          const resp = new Response(cached.body, cached);
-          resp.headers.set('X-SG-Upstream', base);
-          resp.headers.set('X-SG-Cache', 'HIT');
-          return resp;
-        }
-      }
-
-      // 2) fetch (с хинтами CF кэша только если кэш НЕ отключён)
-      const r = await fetch(u.toString(), {
-        method: 'GET',
-        // полезно передать исходные заголовки accept/if-none-match (не обязательно)
-        headers: {
-          'Accept': request.headers.get('Accept') || '*/*',
-          ...(BLOCKS_CACHE_DISABLED ? { 'Cache-Control': 'no-cache' } : {})
-        },
-        cf: BLOCKS_CACHE_DISABLED
-          ? {
-              cacheEverything: false,
-              cacheTtl: 0,
-              cacheTtlByStatus: {
-                "200-299": 0,
-                "404": 0,
-                "500-599": 0
-              }
-            }
-          : {
-              cacheEverything: true,
-              cacheTtl: EDGE_TTL_OK,
-              cacheTtlByStatus: {
-                "200-299": EDGE_TTL_OK,
-                "404": 60,
-                "500-599": 0
-              }
-            }
-      });
-
-      // 404: смысла фолбэкать обычно нет — сразу отдаём
-      if (r.status === 404) {
-        const resp404 = new Response(r.body, r);
-        resp404.headers.set('X-SG-Upstream', base);
-        resp404.headers.set('X-SG-Cache', BLOCKS_CACHE_DISABLED ? 'BYPASS' : 'MISS');
-        if (BLOCKS_CACHE_DISABLED) {
-          resp404.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-          resp404.headers.set('Pragma', 'no-cache');
-          resp404.headers.set('Expires', '0');
-        }
-        return resp404;
-      }
-
-      // кэшируем только удачные ответы
-      if (r.ok) {
-        // защита от “поймали HTML вместо JSON” (бывает при неправильном апстриме/редиректе)
-        // для манифестов проверяем Content-Type
-        if (isManifest) {
-          const ct = (r.headers.get('content-type') || '').toLowerCase();
-          if (ct && !ct.includes('application/json') && !ct.includes('text/json')) {
-            // не кэшируем и пробуем другой апстрим (если когда-то появится)
-            lastErr = new Error(`Manifest looks non-JSON: ${ct} from ${base}`);
-            continue;
-          }
-        }
-
-        const resp = new Response(r.body, r);
-
-        if (BLOCKS_CACHE_DISABLED) {
-          // клиентский кеш-контроль: запрещаем кэш
-          resp.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-          resp.headers.set('Pragma', 'no-cache');
-          resp.headers.set('Expires', '0');
-          resp.headers.set('X-SG-Cache', 'BYPASS');
-        } else {
-          // клиентский кеш-контроль
-          resp.headers.set('Cache-Control', `public, max-age=${BROWSER_TTL_OK}`);
-          resp.headers.set('X-SG-Cache', 'MISS');
-
-          // кладём в edge cache
-          await cache.put(cacheKey, resp.clone());
-        }
-
-        // диагностика
-        resp.headers.set('X-SG-Upstream', base);
-
-        return resp;
-      }
-
-      // если апстрим ответил ошибкой — пробуем следующий (если будет)
-      lastErr = new Error(`Upstream ${base} responded ${r.status}`);
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-
-  throw lastErr || new Error('No upstreams');
-}
-
-async function handleBlocksProxy(request, env) {
-  const url = new URL(request.url);
-
-  // /blocks/<rel>
-  let rel = url.pathname.replace(/^\/blocks\/+/, '');
-  rel = rel.replace(/^\/+/, '');
-  // если фронт случайно прислал /blocks/blocks/blocks/...
-  if (rel.startsWith('blocks/blocks/')) {
-    rel = rel.replace(/^blocks\//, ''); // станет blocks/...
-  }
-
-  // пробуем несколько апстримов по очереди
-  const upstreamResp = await fetchFromUpstreams(rel, request);
-
-  // копируем заголовки и добавляем CORS
-  const headers = new Headers(upstreamResp.headers);
-  const ch = legacyCorsHeaders(request);
-  for (const [k, v] of Object.entries(ch)) headers.set(k, v);
-
-  // ВАЖНО: не перебиваем заголовки, если мы отключили кэш
-  if (BLOCKS_CACHE_DISABLED) {
-    headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    headers.set('Pragma', 'no-cache');
-    headers.set('Expires', '0');
-  } else {
-    // (опционально) более агрессивный кэш для статики блоков
-    if (!headers.has('Cache-Control')) headers.set('Cache-Control', 'public, max-age=300');
-  }
-
-  return new Response(upstreamResp.body, {
-    status: upstreamResp.status,
-    headers
-  });
-}
-
-
+// ================== BLOCKS PROXY ==================
+// Вынесено в src/routes/blocksProxy.ts (fast path в index.ts)
+// Чтобы не было дублирования логики и конфликтов после бандлинга.
 
 
 // ================== AUTH: email + password ==================
