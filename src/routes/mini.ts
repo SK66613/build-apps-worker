@@ -463,7 +463,272 @@ function randomRedeemCode(len = 10){
 }
 
 
-export async function handleMiniApi(request: Request, env: Env, url: URL){
+export 
+
+// ================== STATE BUILDERS (extracted from legacy) ==================
+function nowISO(){ return new Date().toISOString(); }
+
+async function getLastBalance(db, appPublicId, tgId){
+  const row = await db.prepare(
+    `SELECT balance_after FROM coins_ledger
+     WHERE app_public_id = ? AND tg_id = ?
+     ORDER BY id DESC LIMIT 1`
+  ).bind(appPublicId, String(tgId)).first();
+  return row ? Number(row.balance_after||0) : 0;
+}
+
+async function stylesTotalCount(db, appPublicId){
+  const rows = await db.prepare(
+    `SELECT COUNT(DISTINCT style_id) as cnt FROM styles_dict WHERE app_public_id = ?`
+  ).bind(appPublicId).first();
+  return rows ? Number(rows.cnt||0) : 0;
+}
+
+async function passportGetIssued(db, appPublicId, tgId, passportKey){
+  return await db.prepare(
+    `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
+     FROM passport_rewards
+     WHERE app_public_id = ? AND tg_id = ? AND passport_key = ?
+     LIMIT 1`
+  ).bind(appPublicId, String(tgId), String(passportKey||'default')).first();
+}
+
+async function buildLeaderboard(db, appPublicId, dateStr, mode, topN){
+  const rows = await db.prepare(
+    `SELECT gr.tg_id, gr.best_score, au.tg_username
+     FROM games_results_daily gr
+     LEFT JOIN app_users au ON au.app_public_id = gr.app_public_id AND au.tg_user_id = gr.tg_id
+     WHERE gr.app_public_id = ? AND gr.date = ? AND gr.mode = ?
+     GROUP BY gr.tg_id
+     ORDER BY gr.best_score DESC
+     LIMIT ?`
+  ).bind(appPublicId, dateStr, mode, topN).all();
+  return (rows.results||[]).map(r => ({
+    tg_id: String(r.tg_id),
+    username: r.tg_username || '',
+    first_name: '',
+    last_name: '',
+    score: Number(r.best_score||0)
+  }));
+}
+
+async function buildLeaderboardAllTime(db, appPublicId, mode, topN){
+  const rows = await db.prepare(
+    `SELECT gr.tg_id, MAX(gr.best_score) as best_score, au.tg_username
+     FROM games_results_daily gr
+     LEFT JOIN app_users au ON au.app_public_id = gr.app_public_id AND au.tg_user_id = gr.tg_id
+     WHERE gr.app_public_id = ? AND gr.mode = ?
+     GROUP BY gr.tg_id
+     ORDER BY best_score DESC
+     LIMIT ?`
+  ).bind(appPublicId, mode, topN).all();
+  return (rows.results||[]).map(r => ({
+    tg_id: String(r.tg_id),
+    username: r.tg_username || '',
+    first_name: '',
+    last_name: '',
+    score: Number(r.best_score||0)
+  }));
+}
+
+async function refsTotal(db, appPublicId, referrerTgId){
+  const r = await db.prepare(
+    `SELECT COUNT(1) AS c
+     FROM referrals
+     WHERE app_public_id=? AND referrer_tg_id=?`
+  ).bind(String(appPublicId), String(referrerTgId)).first();
+  return Number(r?.c || 0);
+}
+
+async function buildState(db, appId, appPublicId, tgId, cfg = {}){
+  const out = {
+    bot_username: '',
+    coins: 0,
+    last_prizes: [],
+    styles: [],
+    styles_user: [],
+    styles_count: 0,
+    styles_total: 0,
+    last_stamp_id: '',
+    last_stamp_name: '',
+    game_today_best: 0,
+    game_plays_today: 0,
+    leaderboard_today: [],
+    leaderboard_alltime: [],
+    config: {},
+    wheel: { claim_cooldown_left_ms: 0, has_unclaimed: false, last_prize_code: '', last_prize_title: '' },
+    ref_total: 0
+  };
+
+// bot username for referral links (active bot)
+try{
+  const pid = String(appPublicId || '').trim();
+
+  const b = await db.prepare(`
+    SELECT username
+    FROM bots
+    WHERE app_public_id = ? AND status = 'active'
+    ORDER BY id DESC
+    LIMIT 1
+  `).bind(pid).first();
+
+  out.bot_username = b?.username ? String(b.username).replace(/^@/,'').trim() : '';
+}catch(e){
+  console.log('[ref] bot username lookup error', e);
+  out.bot_username = '';
+}
+
+
+
+
+  // coins
+  out.coins = await getLastBalance(db, appPublicId, tgId);
+  if (!out.coins){
+    const u = await db.prepare(
+      `SELECT coins FROM app_users WHERE app_public_id = ? AND tg_user_id = ?`
+    ).bind(appPublicId, String(tgId)).first();
+    out.coins = u ? Number(u.coins||0) : 0;
+  }
+
+  // last prizes (10) из bonus_claims
+  const lp = await db.prepare(
+    `SELECT prize_id, prize_name, prize_value, ts
+     FROM bonus_claims
+     WHERE app_public_id = ? AND tg_id = ?
+     AND (claim_status IS NULL OR claim_status = 'ok')
+     ORDER BY id DESC LIMIT 10`
+  ).bind(appPublicId, String(tgId)).all();
+  out.last_prizes = (lp.results||[]).map(r => ({
+    prize_id: r.prize_id || '',
+    prize_name: r.prize_name || '',
+    prize_value: Number(r.prize_value||0),
+    ts: r.ts || nowISO()
+  }));
+
+  // styles + last stamp
+  const su = await db.prepare(
+    `SELECT style_id, status, ts
+     FROM styles_user
+     WHERE app_public_id = ? AND tg_id = ? AND status = 'collected'
+     ORDER BY ts DESC`
+  ).bind(appPublicId, String(tgId)).all();
+  out.styles_user = (su.results || []).map(r => ({
+    style_id: String(r.style_id || ''),
+    status: String(r.status || 'collected'),
+    ts: r.ts || ''
+  }));
+    
+  let lastTs = 0, lastSid = '';
+  const seen = new Set();
+  
+  for (const r of (su.results || [])) {
+    const sid = String(r.style_id || '');
+    if (sid) seen.add(sid);
+  
+    const tms = r.ts ? (Date.parse(r.ts) || 0) : 0;
+    if (sid && tms > lastTs) { lastTs = tms; lastSid = sid; }
+  }
+  out.styles = Array.from(seen);
+  out.last_stamp_id = lastSid;
+  out.last_stamp_name = await styleTitle(db, appPublicId, lastSid);
+  out.styles_count = out.styles.length;
+  out.styles_total = await stylesTotalCount(db, appPublicId);
+
+    // passport reward snapshot (if issued)
+    try{
+      const rw = await passportGetIssued(db, appPublicId, tgId, 'default');
+      out.passport_reward = rw ? {
+        prize_code: String(rw.prize_code || ''),
+        prize_title: String(rw.prize_title || ''),
+        coins: Number(rw.coins || 0),
+        redeem_code: String(rw.redeem_code || ''),
+        status: String(rw.status || 'issued'),
+        issued_at: rw.issued_at || ''
+      } : null;
+    }catch(_){
+      out.passport_reward = null;
+    }
+  
+
+  // game snapshot today
+  const today = new Date().toISOString().slice(0,10);
+  const mode = 'daily';
+  const g = await db.prepare(
+    `SELECT best_score, plays FROM games_results_daily
+     WHERE app_public_id = ? AND date = ? AND mode = ? AND tg_id = ?
+     ORDER BY id DESC LIMIT 1`
+  ).bind(appPublicId, today, mode, String(tgId)).first();
+  if (g){
+    out.game_today_best = Number(g.best_score||0);
+    out.game_plays_today= Number(g.plays||0);
+  }
+  const topN = Number(cfg.LEADERBOARD_TOP_N || 10) || 10;
+  out.leaderboard_today   = await buildLeaderboard(db, appPublicId, today, mode, topN);
+  out.leaderboard_alltime = await buildLeaderboardAllTime(db, appPublicId, mode, topN);
+
+  // config snapshot (минимум — можешь подтянуть из KV/D1 config)
+  const cdH = Number(cfg.WHEEL_CLAIM_COOLDOWN_H || 24);
+  out.config = {
+    SPIN_COST:                 Number(cfg.SPIN_COST || 0),
+    SPIN_COOLDOWN_SEC:         Number(cfg.SPIN_COOLDOWN_SEC || 0),
+    SPIN_DAILY_LIMIT:          Number(cfg.SPIN_DAILY_LIMIT || 0),
+    QUIZ_COINS_PER_CORRECT:    Number(cfg.QUIZ_COINS_PER_CORRECT || 0),
+    QUIZ_COINS_MAX_PER_SUBMIT: Number(cfg.QUIZ_COINS_MAX_PER_SUBMIT || 0),
+    STYLE_COLLECT_COINS:       Number(cfg.STYLE_COLLECT_COINS || 0),
+    LEADERBOARD_TOP_N:         topN,
+    WHEEL_SPIN_COST:           Number(cfg.WHEEL_SPIN_COST || 0),
+    WHEEL_CLAIM_COOLDOWN_H:    cdH
+  };
+
+
+// wheel: есть ли незабранный "won" и есть ли активный redeem
+out.wheel.claim_cooldown_left_ms = 0;
+
+const lastWon = await db.prepare(
+  `SELECT id, prize_code, prize_title
+   FROM wheel_spins
+   WHERE app_public_id = ? AND tg_id = ? AND status = 'won'
+   ORDER BY id DESC LIMIT 1`
+).bind(appPublicId, String(tgId)).first();
+
+if (lastWon){
+  out.wheel.has_unclaimed = true;
+  out.wheel.last_prize_code  = lastWon.prize_code || '';
+  out.wheel.last_prize_title = lastWon.prize_title || '';
+
+  // если уже выпущен redeem по этому выигрышу — вернём статус (можно показывать "код выдан/получен")
+  const rr = await db.prepare(
+    `SELECT redeem_code, status, issued_at, redeemed_at
+     FROM wheel_redeems
+     WHERE app_public_id = ? AND spin_id = ?
+     LIMIT 1`
+  ).bind(appPublicId, Number(lastWon.id)).first();
+
+  if (rr){
+    out.wheel.redeem_code = rr.redeem_code || '';
+    out.wheel.redeem_status = rr.status || 'issued';
+    out.wheel.redeem_issued_at = rr.issued_at || '';
+    out.wheel.redeem_redeemed_at = rr.redeemed_at || '';
+  } else {
+    out.wheel.redeem_code = '';
+    out.wheel.redeem_status = '';
+  }
+} else {
+  out.wheel.has_unclaimed = false;
+  out.wheel.last_prize_code = '';
+  out.wheel.last_prize_title = '';
+  out.wheel.redeem_code = '';
+  out.wheel.redeem_status = '';
+}
+
+
+  // ref_total — опционально, если введёшь таблицу referrals
+  out.ref_total = await refsTotal(db, appPublicId, tgId);
+
+
+  return out;
+}
+async function handleMiniApi(request: Request, env: Env, url: URL){
   const db = env.DB;
   const publicId = url.searchParams.get('public_id') || url.pathname.split('/').pop();
 
