@@ -1,4 +1,8 @@
 import type { Env } from "../index";
+import { encryptToken, decryptToken } from "../services/crypto";
+import { signToken, verifyToken, getSession } from "../services/session";
+import { tgSendMessage } from "../services/telegramSend";
+
 
 
 // ================== ОСНОВНОЙ WORKER ==================
@@ -15,6 +19,63 @@ export async function legacyFetch(request: Request, env: any, ctx: ExecutionCont
       }
 
       // AUTH
+      if (pathname === '/api/auth/register' && request.method === 'POST') {
+        return handleRegister(request, env, url);
+      }
+      if (pathname === '/api/auth/login' && request.method === 'POST') {
+        return handleLogin(request, env);
+      }
+      if (pathname === '/api/auth/logout' && request.method === 'POST') {
+        return handleLogout(request);
+      }
+      if (pathname === '/api/auth/me' && request.method === 'GET') {
+        return handleMe(request, env);
+      }
+      if (pathname === '/api/auth/confirm' && request.method === 'GET') {
+        return handleConfirmEmail(url, env, request);
+      }
+
+      // Sales QR token (one-time)
+const mSaleTok = pathname.match(/^\/api\/public\/app\/([^/]+)\/sales\/token$/);
+if (mSaleTok && request.method === 'POST') {
+  const publicId = decodeURIComponent(mSaleTok[1]);
+  return handleSalesToken(publicId, request, env);
+}
+
+//pay
+// Stars: create invoice link
+const mStarsCreate = pathname.match(/^\/api\/public\/app\/([^/]+)\/stars\/create$/);
+if (mStarsCreate && request.method === 'POST') {
+  const publicId = decodeURIComponent(mStarsCreate[1]);
+  return handleStarsCreate(publicId, request, env);
+}
+
+// Stars: get order status
+const mStarsGet = pathname.match(/^\/api\/public\/app\/([^/]+)\/stars\/order\/([^/]+)$/);
+if (mStarsGet && request.method === 'GET') {
+  const publicId = decodeURIComponent(mStarsGet[1]);
+  const orderId = decodeURIComponent(mStarsGet[2]);
+  return handleStarsOrderGet(publicId, orderId, request, env);
+}
+
+
+
+
+      // Public events from miniapp
+      const mEvent = pathname.match(/^\/api\/public\/app\/([^/]+)\/event$/);
+      if (mEvent && request.method === 'POST') {
+        const publicId = decodeURIComponent(mEvent[1]);
+        return handlePublicEvent(publicId, request, env);
+      }
+
+      // Telegram webhook (Variant A): POST /api/tg/webhook/:publicId?s=...
+const mTg = pathname.match(/^\/api\/tg\/webhook\/([^/]+)$/);
+if (mTg && request.method === 'POST') {
+  const publicId = decodeURIComponent(mTg[1]);
+  return handleTelegramWebhook(publicId, request, env);
+}
+
+
       /* ⬇️ ДОБАВИТЬ ВОТ ЭТО — мини-API для опубликованных мини-аппов */
 
 
@@ -186,58 +247,9 @@ if (dlgMatch) {
 //  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ СЕКРЕТНЫХ ТОКЕНОВ БОТОВ
 // ======================================================
 
-async function encryptToken(plain, masterKey) {
-  const enc = new TextEncoder();
-  const masterBytes = enc.encode(masterKey);
-  const keyBytes = await crypto.subtle.digest('SHA-256', masterBytes);
+// [encryptToken] moved to src/services/*
 
-  const key = await crypto.subtle.importKey(
-    'raw',
-    keyBytes,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt']
-  );
-
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    enc.encode(plain)
-  );
-
-  const buf = new Uint8Array(iv.byteLength + ciphertext.byteLength);
-  buf.set(iv, 0);
-  buf.set(new Uint8Array(ciphertext), iv.byteLength);
-
-  return btoa(String.fromCharCode(...buf));
-}
-
-async function decryptToken(cipherText, masterKey) {
-  const raw = Uint8Array.from(atob(cipherText), c => c.charCodeAt(0));
-  const iv = raw.slice(0, 12);
-  const data = raw.slice(12);
-
-  const enc = new TextEncoder();
-  const masterBytes = enc.encode(masterKey);
-  const keyBytes = await crypto.subtle.digest('SHA-256', masterBytes);
-
-  const key = await crypto.subtle.importKey(
-    'raw',
-    keyBytes,
-    { name: 'AES-GCM' },
-    false,
-    ['decrypt']
-  );
-
-  const plain = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    data
-  );
-
-  return new TextDecoder().decode(plain);
-}
+// [decryptToken] moved to src/services/*
 
 async function verifyInitDataSignature(initData, botToken) {
   if (!initData || !botToken) return false;
@@ -412,7 +424,7 @@ async function getCanonicalPublicIdForApp(appId, env){
 }
 
 // =============== pay ===============
-export async function handleStarsCreate(publicId, request, env){
+async function handleStarsCreate(publicId, request, env){
   // ожидаем JSON:
   // { tg_user:{id,username}, title, description, photo_url, items:[{product_id,title,stars,qty,meta?}] }
   let body = {};
@@ -482,7 +494,7 @@ export async function handleStarsCreate(publicId, request, env){
   return json({ ok:true, order_id: orderId, invoice_link, total_stars: totalStars }, 200, request);
 }
 
-export async function handleStarsOrderGet(publicId, orderId, request, env){
+async function handleStarsOrderGet(publicId, orderId, request, env){
   const row = await env.DB.prepare(`
     SELECT id, app_public_id, tg_id, total_stars, status, created_at, paid_at
     FROM stars_orders
@@ -497,7 +509,7 @@ export async function handleStarsOrderGet(publicId, orderId, request, env){
 
 
 // =============== PUBLIC EVENTS (из мини-аппа в D1) ===============
-export async function handlePublicEvent(publicId, request, env) {
+async function handlePublicEvent(publicId, request, env) {
   let body;
   try {
     body = await request.json();
@@ -952,63 +964,9 @@ function randomHex(len = 32) {
   return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('').slice(0, len);
 }
 
-async function signToken(payload, secret) {
-  const enc = new TextEncoder();
-  const header = { alg: "HS256", typ: "JWT" };
-  const headerBytes = enc.encode(JSON.stringify(header));
-  const payloadBytes = enc.encode(JSON.stringify(payload));
+// [signToken] moved to src/services/*
 
-  const headerB64 = base64UrlEncode(headerBytes);
-  const payloadB64 = base64UrlEncode(payloadBytes);
-
-  const data = headerB64 + "." + payloadB64;
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
-  const sigB64 = base64UrlEncode(new Uint8Array(sig));
-
-  return data + "." + sigB64;
-}
-
-async function verifyToken(token, secret) {
-  if (!token) return null;
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [headerB64, payloadB64, sigB64] = parts;
-  const enc = new TextEncoder();
-  const data = headerB64 + "." + payloadB64;
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const expectedSig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
-  const expectedSigB64 = base64UrlEncode(new Uint8Array(expectedSig));
-
-  if (expectedSigB64 !== sigB64) return null;
-
-  try {
-    const bytes = base64UrlDecode(payloadB64);
-    const jsonStr = new TextDecoder().decode(bytes);
-    const payload = JSON.parse(jsonStr);
-    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
-      return null;
-    }
-    return payload;
-  } catch (e) {
-    console.error("[auth] verifyToken JSON error", e);
-    return null;
-  }
-}
+// [verifyToken] moved to src/services/*
 
 function getSessionTokenFromRequest(request) {
   const cookie = request.headers.get("Cookie") || "";
@@ -1016,20 +974,7 @@ function getSessionTokenFromRequest(request) {
   return m ? m[1] : null;
 }
 
-async function getSession(request, env) {
-  const secret = env.SESSION_SECRET;
-  if (!secret || secret.length < 16) {
-    return null;
-  }
-  const token = getSessionTokenFromRequest(request);
-  if (!token) return null;
-  try {
-    return await verifyToken(token, secret);
-  } catch (e) {
-    console.error("[auth] getSession verify error", e);
-    return null;
-  }
-}
+// [getSession] moved to src/services/*
 
 async function requireSession(request, env){
   const s = await getSession(request, env);
@@ -1062,7 +1007,7 @@ async function sendVerificationEmail(email, confirmUrl, env) {
 }
 
 // POST /api/auth/register
-export async function handleRegister(request, env, url) {
+async function handleRegister(request, env, url) {
   const db = env.DB;
 
   let body;
@@ -1135,7 +1080,7 @@ export async function handleRegister(request, env, url) {
 }
 
 // GET /api/auth/confirm?token=...
-export async function handleConfirmEmail(url, env, request) {
+async function handleConfirmEmail(url, env, request) {
   const db = env.DB;
   if (!db) {
     return json({ ok: false, error: "NO_DB" }, 500, request);
@@ -1182,7 +1127,7 @@ export async function handleConfirmEmail(url, env, request) {
 }
 
 // POST /api/auth/login
-export async function handleLogin(request, env) {
+async function handleLogin(request, env) {
   const db = env.DB;
   if (!db) {
     return json({ ok: false, error: "NO_DB" }, 500, request);
@@ -1237,7 +1182,7 @@ export async function handleLogin(request, env) {
 }
 
 // POST /api/auth/logout
-export async function handleLogout(request) {
+async function handleLogout(request) {
   const resp = json({ ok: true }, 200, request);
   resp.headers.append(
     "Set-Cookie",
@@ -1248,7 +1193,7 @@ export async function handleLogout(request) {
 }
 
 // GET /api/auth/me
-export async function handleMe(request, env) {
+async function handleMe(request, env) {
   const db = env.DB;
   if (!db) {
     return json({ ok: false, error: "NO_DB" }, 500, request);
@@ -1975,59 +1920,7 @@ const wh = await ensureBotWebhookSecretForPublicId(appPublicId, env);
 
 // ================== TELEGRAM WEBHOOK (Variant A) ==================
 
-async function tgSendMessage(env, botToken, chatId, text, extra = {}, meta = {}) {
-  // meta: { appPublicId, tgUserId }
-  const payload = {
-    chat_id: chatId,
-    text: String(text || ''),
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    ...extra,
-  };
-
-  const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-
-  let respText = '';
-  if (!resp.ok) {
-    respText = await resp.text().catch(() => '');
-    console.error('[tgSendMessage] bad', resp.status, respText.slice(0, 500));
-  }
-
-  // log outgoing
-  try {
-    if (meta && meta.appPublicId && meta.tgUserId) {
-      await logBotMessage(env.DB, {
-        appPublicId: meta.appPublicId,
-        tgUserId: meta.tgUserId,
-        direction: 'out',
-        msgType: 'text',
-        text: String(text || ''),
-        chatId: chatId,
-        tgMessageId: null,
-        payload: { request: payload, ok: resp.ok, status: resp.status, error: resp.ok ? null : respText.slice(0, 500) }
-      });
-
-      // update counters + blocked status
-      let status = null;
-      if (!resp.ok && (resp.status === 403) && /blocked|bot was blocked/i.test(respText || '')) {
-        status = 'blocked';
-      }
-      await bumpBotOutCounters(env.DB, {
-        appPublicId: meta.appPublicId,
-        tgUserId: meta.tgUserId,
-        status
-      });
-    }
-  } catch (e) {
-    console.error('[bot] log outgoing failed', e);
-  }
-
-  return resp;
-}
+// [tgSendMessage] moved to src/services/*
 
 
 async function getSalesSettings(db, appPublicId){
@@ -2063,7 +1956,7 @@ function parseAmountToCents(s){
 
 
 
-export async function handleTelegramWebhook(publicId, request, env) {
+async function handleTelegramWebhook(publicId, request, env) {
   // 1) check secret from query (?s=...)
   const url = new URL(request.url);
   const s = url.searchParams.get('s') || '';
@@ -4761,7 +4654,7 @@ async function getSalesSettingsFromD1(publicId, env){
 }
 
 
-export async function handleSalesToken(publicId, request, env){
+async function handleSalesToken(publicId, request, env){
   // ожидаем JSON: { init_data: "...", ttl_sec?: 300 }
   let body = {};
   try{ body = await request.json(); }catch(_){}
