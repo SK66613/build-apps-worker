@@ -73,9 +73,7 @@ if (mTg && request.method === 'POST') {
 
 
       /* ⬇️ ДОБАВИТЬ ВОТ ЭТО — мини-API для опубликованных мини-аппов */
-if (pathname.startsWith('/api/mini/')) {
-  return handleMiniApi(request, env, url);
-}
+
 
 // /app/:publicId (и /m/:publicId) — редиректим на публичный runtime на mini.salesgenius.ru
 if (pathname.startsWith('/app/') || pathname.startsWith('/m/')) {
