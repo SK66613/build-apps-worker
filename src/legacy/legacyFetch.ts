@@ -5,15 +5,7 @@ import type { Env } from "../index";
 export async function legacyFetch(request: Request, env: any, ctx: ExecutionContext) {
 
     const url = new URL(request.url);
-    if (url.pathname.startsWith('/blocks/')) {
-      if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: corsHeaders(request) });
-      }
-      if (request.method !== 'GET') {
-        return new Response('Method Not Allowed', { status: 405, headers: corsHeaders(request) });
-      }
-      return handleBlocksProxy(request, env); // ✅ env, не url
-    }
+
     const pathname = url.pathname;
 
     try {
