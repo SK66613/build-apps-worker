@@ -3,8 +3,13 @@ account_id = "c6cf1c837633b7f6488e63ec894e09b7"
 main = "src/index.ts"
 compatibility_date = "2025-02-01"
 
+[observability]
+enabled = true
 
-# ===== Bindings (заполни IDs) =====
+[observability.logs]
+invocation_logs = true
+
+# ===== Bindings =====
 [[d1_databases]]
 binding = "DB"
 database_id = "4abaa5fb-74f6-4b5b-a315-116c64bd4e9d"
@@ -16,5 +21,3 @@ id = "06aa3d1d256b45e2955a97211eb89786"
 [[kv_namespaces]]
 binding = "BOT_SECRETS"
 id = "c045bd833bb24b62bc2c9b2a9299413a"
-
-
