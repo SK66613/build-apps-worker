@@ -3,6 +3,10 @@ account_id = "c6cf1c837633b7f6488e63ec894e09b7"
 main = "src/index.ts"
 compatibility_date = "2025-02-01"
 
+[vars]
+GITHUB_SHA = ""
+
+
 [observability]
 enabled = true
 

@@ -1,25 +1,18 @@
 // src/middleware/cors.ts
-const CORS_ALLOW = new Set<string>([
-  "https://app.salesgenius.ru",
-  "https://mini.salesgenius.ru",
-  "https://blocks.salesgenius.ru",
-  "https://ru.salesgenius.ru",
-  "https://apps.salesgenius.ru",
-  "https://web.telegram.org",
-  "https://web.telegram.org/k",
-  "https://web.telegram.org/z",
-]);
+import { ALLOW_ORIGINS_SET } from "../config/origins";
 
 export function corsHeaders(request: Request): Record<string, string> {
   const origin = request.headers.get("Origin") || "";
 
-  // no origin (same-origin / server-to-server)
+  // No Origin => not a CORS request (same-origin or server-to-server)
   if (!origin) return { Vary: "Origin" };
 
-  // strict allowlist
-  if (!CORS_ALLOW.has(origin)) return { Vary: "Origin" };
+  // Strict allowlist
+  if (!ALLOW_ORIGINS_SET.has(origin)) return { Vary: "Origin" };
 
-  const reqHeaders = request.headers.get("Access-Control-Request-Headers") || "Content-Type, Authorization";
+  const reqHeaders =
+    request.headers.get("Access-Control-Request-Headers") ||
+    "Content-Type, Authorization";
 
   return {
     "Access-Control-Allow-Origin": origin,

@@ -10,7 +10,7 @@ export async function legacyFetch(request: Request, env: any, ctx: ExecutionCont
 
     try {
       if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: corsHeaders(request) });
+        return new Response(null, { status: 204, headers: legacyCorsHeaders(request) });
       }
 
       // AUTH
@@ -921,7 +921,7 @@ function getSeedConfig(templateId) {
 // ВАЖНО: corsHeaders должен существовать в той же области видимости, где вызывается json().
 // Поэтому держим всё рядом и без "const corsHeaders = ..." (чтобы не поймать TDZ/ReferenceError при бандлинге).
 
-const CORS_ALLOW = new Set([
+const LEGACY_CORS_ALLOW = new Set([
   "https://app.salesgenius.ru",
   "https://mini.salesgenius.ru",
   "https://blocks.salesgenius.ru",   // CDN с блоками (Pages/GH Pages)
@@ -935,11 +935,11 @@ const CORS_ALLOW = new Set([
 ]);
 
 
-function corsHeaders(request) {
+function legacyCorsHeaders(request) {
   const origin = request?.headers?.get("Origin") || "";
   if (!origin) return { "Vary": "Origin" }; // нет Origin — не CORS
 
-  if (!CORS_ALLOW.has(origin)) return { "Vary": "Origin" };
+  if (!LEGACY_CORS_ALLOW.has(origin)) return { "Vary": "Origin" };
 
   return {
     "Access-Control-Allow-Origin": origin,
@@ -956,7 +956,7 @@ function json(obj, status = 200, request = null) {
     status,
     headers: {
       "Content-Type": "application/json; charset=UTF-8",
-      ...corsHeaders(request),
+      ...legacyCorsHeaders(request),
     },
   });
 }
@@ -1119,7 +1119,7 @@ async function handleBlocksProxy(request, env) {
 
   // копируем заголовки и добавляем CORS
   const headers = new Headers(upstreamResp.headers);
-  const ch = corsHeaders(request);
+  const ch = legacyCorsHeaders(request);
   for (const [k, v] of Object.entries(ch)) headers.set(k, v);
 
   // ВАЖНО: не перебиваем заголовки, если мы отключили кэш
@@ -2320,7 +2320,7 @@ async function handleTelegramWebhook(publicId, request, env) {
   const expected = await getBotWebhookSecretForPublicId(publicId, env);
 
   if (!expected || !timingSafeEqual(s, expected)) {
-    return new Response('FORBIDDEN', { status: 403, headers: corsHeaders(request) });
+    return new Response('FORBIDDEN', { status: 403, headers: legacyCorsHeaders(request) });
   }
 
   // 2) parse update (always return 200 to Telegram)
@@ -2328,7 +2328,7 @@ async function handleTelegramWebhook(publicId, request, env) {
   try {
     upd = await request.json();
   } catch (e) {
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // 3) dedupe update_id (KV TTL)
@@ -2336,7 +2336,7 @@ async function handleTelegramWebhook(publicId, request, env) {
   if (env.BOT_SECRETS && updateId) {
     const k = `tg_upd:public:${publicId}:${updateId}`;
     const seen = await env.BOT_SECRETS.get(k);
-    if (seen) return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    if (seen) return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     await env.BOT_SECRETS.put(k, '1', { expirationTtl: 3600 }); // 1 hour
   }
 
@@ -2368,7 +2368,7 @@ async function handleTelegramWebhook(publicId, request, env) {
         }
 
         await tgAnswerPreCheckoutQuery(botTokenEarly, pcq.id, ok, err);
-        return new Response('OK', { status: 200, headers: corsHeaders(request) });
+        return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
       }
 
       // B) successful_payment
@@ -2395,7 +2395,7 @@ async function handleTelegramWebhook(publicId, request, env) {
           ).run();
         }
 
-        return new Response('OK', { status: 200, headers: corsHeaders(request) });
+        return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
       }
     }
   } catch (e) {
@@ -2426,7 +2426,7 @@ async function handleTelegramWebhook(publicId, request, env) {
     '';
 
   if (!chatId || !from) {
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // 5) get bot token from KV
@@ -2440,13 +2440,13 @@ async function handleTelegramWebhook(publicId, request, env) {
 
 
   if (!botToken) {
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // 6) resolve canonical ctx (for appId + canonical publicId)
   const ctx = await resolveAppContextByPublicId(publicId, env);
   if (!ctx || !ctx.ok) {
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
   const appPublicId = ctx.publicId || publicId;
   const appId = ctx.appId;
@@ -2476,7 +2476,7 @@ if (upd && upd.callback_query && upd.callback_query.data){
 
     if (!act || !act.customerTgId){
       await tgAnswerCallbackQuery(botToken, cqId, 'Контекст продажи не найден (истёк).', true);
-      return new Response('OK', { status: 200, headers: corsHeaders(request) });
+      return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     }
 
     // rollback coins (идемпотентно)
@@ -2508,7 +2508,7 @@ if (upd && upd.callback_query && upd.callback_query.data){
     }catch(_){}
 
     await tgAnswerCallbackQuery(botToken, cqId, 'Готово ✅', false);
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // 2) PIN MENU (choose stamp/day)
@@ -2518,7 +2518,7 @@ if (upd && upd.callback_query && upd.callback_query.data){
 
     if (!act || !act.customerTgId){
       await tgAnswerCallbackQuery(botToken, cqId, 'Контекст продажи не найден (истёк).', true);
-      return new Response('OK', { status: 200, headers: corsHeaders(request) });
+      return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     }
 
     // load styles list from styles_dict
@@ -2536,7 +2536,7 @@ if (upd && upd.callback_query && upd.callback_query.data){
         {}, { appPublicId, tgUserId: cashierTgId }
       );
       await tgAnswerCallbackQuery(botToken, cqId, 'Нет стилей', true);
-      return new Response('OK', { status: 200, headers: corsHeaders(request) });
+      return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     }
 
     // build keyboard 2 columns
@@ -2557,7 +2557,7 @@ if (upd && upd.callback_query && upd.callback_query.data){
     );
 
     await tgAnswerCallbackQuery(botToken, cqId, 'Выбери стиль', false);
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // 3) PIN MAKE (generate + send to customer)
@@ -2570,11 +2570,11 @@ if (upd && upd.callback_query && upd.callback_query.data){
     const act = await loadSaleAction(saleId);
     if (!act || !act.customerTgId){
       await tgAnswerCallbackQuery(botToken, cqId, 'Контекст продажи не найден (истёк).', true);
-      return new Response('OK', { status: 200, headers: corsHeaders(request) });
+      return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     }
     if (!styleId){
       await tgAnswerCallbackQuery(botToken, cqId, 'Нет style_id', true);
-      return new Response('OK', { status: 200, headers: corsHeaders(request) });
+      return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     }
 
     // title
@@ -2589,7 +2589,7 @@ if (upd && upd.callback_query && upd.callback_query.data){
     const pinRes = await issuePinToCustomer(env.DB, appPublicId, cashierTgId, String(act.customerTgId), styleId);
     if (!pinRes || !pinRes.ok){
       await tgAnswerCallbackQuery(botToken, cqId, 'Не удалось создать PIN', true);
-      return new Response('OK', { status: 200, headers: corsHeaders(request) });
+      return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     }
 
     // send PIN to customer (NOT cashier)
@@ -2611,12 +2611,12 @@ if (upd && upd.callback_query && upd.callback_query.data){
     );
 
     await tgAnswerCallbackQuery(botToken, cqId, 'PIN отправлен ✅', false);
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // unknown callback
   await tgAnswerCallbackQuery(botToken, cqId, 'Неизвестное действие', false);
-  return new Response('OK', { status: 200, headers: corsHeaders(request) });
+  return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
 }
 
 
@@ -2678,7 +2678,7 @@ if (payload.startsWith('redeem_')) {
       '⛔️ Вы не зарегистрированы как кассир для этого проекта.',
       {}, { appPublicId, tgUserId: from.id }
     );
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // 2) найти redeem
@@ -2707,7 +2707,7 @@ if (!r){
       '⛔️ Код недействителен или приз не найден.',
       {}, { appPublicId, tgUserId: from.id }
     );
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   if (String(pr.status) === 'redeemed'){
@@ -2715,7 +2715,7 @@ if (!r){
       'ℹ️ Этот приз уже отмечен как полученный.',
       {}, { appPublicId, tgUserId: from.id }
     );
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // 3b) пометить паспортный приз redeemed (важно: only issued -> redeemed)
@@ -2733,7 +2733,7 @@ if (!r){
       'ℹ️ Этот приз уже отмечен как полученный.',
       {}, { appPublicId, tgUserId: from.id }
     );
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   const coins = Math.max(0, Math.floor(Number(pr.coins || 0)));
@@ -2789,7 +2789,7 @@ if (!r){
     );
   }catch(_){}
 
-  return new Response('OK', { status: 200, headers: corsHeaders(request) });
+  return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
 }
 
 
@@ -2801,7 +2801,7 @@ if (!r){
       '⛔️ Код недействителен или приз не найден.',
       {}, { appPublicId, tgUserId: from.id }
     );
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   if (String(r.status) === 'redeemed'){
@@ -2809,7 +2809,7 @@ if (!r){
       'ℹ️ Этот приз уже отмечен как полученный.',
       {}, { appPublicId, tgUserId: from.id }
     );
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // 3) пометить redeemed
@@ -2842,7 +2842,7 @@ if (!r){
     );
   }catch(_){}
 
-  return new Response('OK', { status: 200, headers: corsHeaders(request) });
+  return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
 }
 
 
@@ -2857,7 +2857,7 @@ if (!r){
 
       if (!rawTok){
         await tgSendMessage(env, botToken, chatId, '⛔️ Этот QR устарел. Попросите клиента обновить QR.', {}, { appPublicId, tgUserId: from.id });
-        return new Response('OK', { status: 200, headers: corsHeaders(request) });
+        return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
       }
 
       let tokObj = null;
@@ -2871,7 +2871,7 @@ if (!r){
 
       if (!isCashier){
         await tgSendMessage(env, botToken, chatId, '⛔️ Вы не зарегистрированы как кассир для этого проекта.', {}, { appPublicId, tgUserId: from.id });
-        return new Response('OK', { status: 200, headers: corsHeaders(request) });
+        return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
       }
 
       // 3) сохранить pending sale
@@ -2897,12 +2897,12 @@ if (!r){
         { appPublicId: tokenAppPublicId, tgUserId: from.id }
       );
 
-      return new Response('OK', { status: 200, headers: corsHeaders(request) });
+      return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     }
 
     // обычный старт
     await tgSendMessage(env, botToken, chatId, 'Привет! Я бот этого мини-аппа ✅\nКоманда: /profile', {}, { appPublicId, tgUserId: from.id });
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // === AMOUNT STEP: если кассир ввёл число после sale_pending ===
@@ -2917,7 +2917,7 @@ if (!r){
       const cents = parseAmountToCents(t);
       if (cents == null){
         await tgSendMessage(env, botToken, chatId, 'Введите сумму числом (например 350 или 350.50)', {}, { appPublicId, tgUserId: from.id });
-        return new Response('OK', { status: 200, headers: corsHeaders(request) });
+        return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
       }
 
       const cbp = Math.max(0, Math.min(100, Number(pend?.cashback_percent ?? 10)));
@@ -3013,7 +3013,7 @@ try{
       // clear pending
       if (env.BOT_SECRETS) await env.BOT_SECRETS.delete(pendKey);
 
-      return new Response('OK', { status: 200, headers: corsHeaders(request) });
+      return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
     }
   }catch(e){
     console.error('[sale_flow] amount step error', e);
@@ -3041,12 +3041,12 @@ try{
       await tgSendMessage(env, botToken, chatId, 'Ошибка при получении профиля 😕', {}, { appPublicId, tgUserId: from.id });
     }
 
-    return new Response('OK', { status: 200, headers: corsHeaders(request) });
+    return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
   }
 
   // default
   await tgSendMessage(env, botToken, chatId, 'Принял ✅\nКоманда: /profile', {}, { appPublicId, tgUserId: from.id });
-  return new Response('OK', { status: 200, headers: corsHeaders(request) });
+  return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
 }
 
 
@@ -3412,7 +3412,7 @@ async function sendDialogMessage(appId, tgUserId, env, ownerId, request){
               `⛔️ PIN не принят: <b>${String(pres?.error || 'pin_invalid')}</b>\nПопробуйте ещё раз.`,
               {}, { appPublicId, tgUserId: from.id }
             );
-            return new Response('OK', { status: 200, headers: corsHeaders(request) });
+            return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
           }
 
           // upsert styles_user
@@ -3436,7 +3436,7 @@ async function sendDialogMessage(appId, tgUserId, env, ownerId, request){
             {}, { appPublicId, tgUserId: from.id }
           );
 
-          return new Response('OK', { status: 200, headers: corsHeaders(request) });
+          return new Response('OK', { status: 200, headers: legacyCorsHeaders(request) });
         }
       }
     }
@@ -4268,7 +4268,7 @@ async function handleMiniApi(request, env, url){
   const publicId = url.searchParams.get('public_id') || url.pathname.split('/').pop();
 
   if (request.method === 'OPTIONS') {
-    return new Response('', { status:204, headers: corsHeaders(request) });
+    return new Response('', { status:204, headers: legacyCorsHeaders(request) });
   }
 
   // читаем JSON
@@ -6146,9 +6146,9 @@ if (appCfgMatch) {
 
 
 
-      return new Response('Not found', { status: 404, headers: corsHeaders(request) });
+      return new Response('Not found', { status: 404, headers: legacyCorsHeaders(request) });
     } catch (e) {
       console.error(e);
-      return new Response('Server error', { status: 500, headers: corsHeaders(request) });
+      return new Response('Server error', { status: 500, headers: legacyCorsHeaders(request) });
     }
 }
