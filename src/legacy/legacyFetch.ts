@@ -6159,5 +6159,4 @@ if (appCfgMatch) {
       console.error(e);
       return new Response('Server error', { status: 500, headers: corsHeaders(request) });
     }
-  },
-};
+}
