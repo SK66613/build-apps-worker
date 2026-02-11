@@ -1,6 +1,6 @@
 // src/routes/telegram.ts
 import type { Env } from "../index";
-import { handleTelegramWebhook } from "../legacy/legacyFetch";
+import { handleTelegramWebhook } from "../handlers/telegramHandlers";
 
 export async function routeTelegram(request: Request, env: Env, url: URL): Promise<Response | null> {
   const m = url.pathname.match(/^\/api\/tg\/webhook\/([^/]+)$/);

@@ -6,7 +6,7 @@ import {
   handleLogout,
   handleMe,
   handleConfirmEmail,
-} from "../legacy/legacyFetch";
+} from "../handlers/authHandlers";
 
 export async function routeAuth(request: Request, env: Env, url: URL): Promise<Response | null> {
   const p = url.pathname;

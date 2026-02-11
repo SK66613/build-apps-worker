@@ -96,13 +96,13 @@ export async function getSession(request, env) {
   }
 }
 
-async function requireSession(request, env){
+export async function requireSession(request, env){
   const s = await getSession(request, env);
   if (!s || !s.uid) return null;
   return s;
 }
 
-async function createSessionCookie(user, env) {
+export async function createSessionCookie(user, env) {
   const secret = env.SESSION_SECRET;
   if (!secret || secret.length < 16) {
     console.error("[auth] SESSION_SECRET missing or too short");

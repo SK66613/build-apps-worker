@@ -5,7 +5,8 @@ import {
   handleSalesToken,
   handleStarsCreate,
   handleStarsOrderGet,
-} from "../legacy/legacyFetch";
+  getPublicConfig,
+} from "../handlers/publicHandlers";
 
 export async function routePublic(request: Request, env: Env, url: URL): Promise<Response | null> {
   const pathname = url.pathname;
@@ -37,6 +38,13 @@ export async function routePublic(request: Request, env: Env, url: URL): Promise
     const publicId = decodeURIComponent(mStarsGet[1]);
     const orderId = decodeURIComponent(mStarsGet[2]);
     return handleStarsOrderGet(publicId, orderId, request as any, env as any);
+  }
+
+  // Public config for published miniapp
+  const mCfg = pathname.match(/^\/api\/public\/app\/([^/]+)\/config$/);
+  if (mCfg && request.method === "GET") {
+    const publicId = decodeURIComponent(mCfg[1]);
+    return getPublicConfig(publicId, env as any, request as any);
   }
 
   return null;

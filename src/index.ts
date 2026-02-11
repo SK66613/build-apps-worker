@@ -1,12 +1,17 @@
 import { withCors, handleOptions } from "./middleware/cors";
 import { json } from "./utils/http";
-import { legacyFetch } from "./legacy/legacyFetch";
 
 import { handleBlocksProxy } from "./routes/blocksProxy";
 import { handleHealth, handleVersion } from "./routes/health";
 import { enforceSameOriginForMutations } from "./middleware/security";
 
 import { routeMiniApi } from "./routes/mini";
+import { routeAuth } from "./routes/auth";
+import { routePublic } from "./routes/public";
+import { routeTelegram } from "./routes/telegram";
+import { routeCabinet } from "./routes/cabinet";
+import { routeTemplates } from "./routes/templates";
+import { routeAnalytics } from "./routes/analytics";
 
 export interface Env {
   DB: D1Database;
@@ -36,6 +41,25 @@ if (url.pathname.startsWith("/api/mini/")) {
 }
 
 
+
+      // /app/:publicId и /m/:publicId — редирект на публичный runtime
+      if (url.pathname.startsWith("/app/") || url.pathname.startsWith("/m/")) {
+        const parts = url.pathname.split("/").filter(Boolean); // ['app','<id>'] или ['m','<id>']
+        const publicId = parts[1] || "";
+        const target = "https://mini.salesgenius.ru/m/" + encodeURIComponent(publicId);
+        return withCors(request, Response.redirect(target, 302));
+      }
+
+      // New routers (thin wrappers around legacy handlers for now)
+      const rAuth = await routeAuth(request, env, url);
+      if (rAuth) return withCors(request, rAuth);
+
+      const rPub = await routePublic(request, env, url);
+      if (rPub) return withCors(request, rPub);
+
+      const rTg = await routeTelegram(request, env, url);
+      if (rTg) return withCors(request, rTg);
+
       // Health / Version
       if (url.pathname === "/_health") return withCors(request, handleHealth());
       if (url.pathname === "/_version") return withCors(request, handleVersion(env));
@@ -43,9 +67,29 @@ if (url.pathname.startsWith("/api/mini/")) {
       // CSRF protection for cookie-auth mutations (API endpoints)
       // ВАЖНО: /api/mini/* часто вызывается из mini.salesgenius.ru и это норм.
       if (url.pathname.startsWith("/api/")) {
-        const csrf = enforceSameOriginForMutations(request);
-        if (csrf) return withCors(request, csrf);
+        // CSRF protection applies only to cookie-auth кабинета.
+        // Server-to-server endpoints (tg webhook) and public miniapp endpoints must work without Origin.
+        const skip =
+          url.pathname.startsWith("/api/mini/") ||
+          url.pathname.startsWith("/api/public/") ||
+          url.pathname.startsWith("/api/tg/");
+        if (!skip) {
+          const csrf = enforceSameOriginForMutations(request);
+          if (csrf) return withCors(request, csrf);
+        }
       }
+
+      // Templates (cookie session GET)
+      const rTpl = await routeTemplates(request, env, url);
+      if (rTpl) return withCors(request, rTpl);
+
+      // Cabinet legacy-compat analytics (/api/cabinet/apps/*)
+      const rAn = await routeAnalytics(request, env, url);
+      if (rAn) return withCors(request, rAn);
+
+      // Cabinet routes (cookie session)
+      const rCab = await routeCabinet(request, env, url);
+      if (rCab) return withCors(request, rCab);
 
       // Blocks proxy (fast path)
       if (url.pathname.startsWith("/blocks/")) {
@@ -55,10 +99,6 @@ if (url.pathname.startsWith("/api/mini/")) {
         const r = await handleBlocksProxy(request);
         return withCors(request, r);
       }
-
-      // Legacy router (everything else)
-      const resp = await legacyFetch(request, env, ctx);
-      if (resp) return withCors(request, resp);
 
       return withCors(request, json({ ok: false, error: "NOT_FOUND" }, 404, request));
     } catch (e: any) {
