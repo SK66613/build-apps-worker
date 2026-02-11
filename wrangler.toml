@@ -5,12 +5,12 @@ compatibility_date = "2025-02-01"
 # ===== Bindings (заполни IDs) =====
 [[d1_databases]]
 binding = "DB"
-database_id = "PASTE_D1_DATABASE_ID"
+database_id = "4abaa5fb-74f6-4b5b-a315-116c64bd4e9d"
 
 [[kv_namespaces]]
 binding = "APPS"
-id = "PASTE_KV_APPS_ID"
+id = "06aa3d1d256b45e2955a97211eb89786"
 
 [[kv_namespaces]]
 binding = "BOT_SECRETS"
-id = "PASTE_KV_BOT_SECRETS_ID"
+id = "c045bd833bb24b62bc2c9b2a9299413a"
