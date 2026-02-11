@@ -462,11 +462,31 @@ function randomRedeemCode(len = 10){
   return 'SG-' + s.slice(0,4) + '-' + s.slice(4,8) + (len>8 ? '-' + s.slice(8) : '');
 }
 
+// ================== STYLES HELPERS (needed by buildState) ==================
+async function styleTitle(db, appPublicId, styleId){
+  const row = await db.prepare(
+    `SELECT title
+     FROM styles_dict
+     WHERE app_public_id = ? AND style_id = ?
+     LIMIT 1`
+  ).bind(String(appPublicId), String(styleId || '')).first();
 
-export 
+  return row ? String(row.title || '') : '';
+}
+
+async function stylesTotalCount(db, appPublicId){
+  const row = await db.prepare(
+    `SELECT COUNT(DISTINCT style_id) as cnt
+     FROM styles_dict
+     WHERE app_public_id = ?`
+  ).bind(String(appPublicId)).first();
+
+  return row ? Number(row.cnt || 0) : 0;
+}
 
 // ================== STATE BUILDERS (extracted from legacy) ==================
 function nowISO(){ return new Date().toISOString(); }
+
 
 async function getLastBalance(db, appPublicId, tgId){
   const row = await db.prepare(
