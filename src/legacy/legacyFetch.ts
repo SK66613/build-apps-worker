@@ -1,5 +1,253 @@
 import type { Env } from "../index";
 
+
+// ================== ОСНОВНОЙ WORKER ==================
+export async function legacyFetch(request: Request, env: any, ctx: ExecutionContext) {
+
+    const url = new URL(request.url);
+    if (url.pathname.startsWith('/blocks/')) {
+      if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: corsHeaders(request) });
+      }
+      if (request.method !== 'GET') {
+        return new Response('Method Not Allowed', { status: 405, headers: corsHeaders(request) });
+      }
+      return handleBlocksProxy(request, env); // ✅ env, не url
+    }
+    const pathname = url.pathname;
+
+    try {
+      if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: corsHeaders(request) });
+      }
+
+      // AUTH
+      if (pathname === '/api/auth/register' && request.method === 'POST') {
+        return handleRegister(request, env, url);
+      }
+      if (pathname === '/api/auth/login' && request.method === 'POST') {
+        return handleLogin(request, env);
+      }
+      if (pathname === '/api/auth/logout' && request.method === 'POST') {
+        return handleLogout(request);
+      }
+      if (pathname === '/api/auth/me' && request.method === 'GET') {
+        return handleMe(request, env);
+      }
+      if (pathname === '/api/auth/confirm' && request.method === 'GET') {
+        return handleConfirmEmail(url, env, request);
+      }
+
+      // Sales QR token (one-time)
+const mSaleTok = pathname.match(/^\/api\/public\/app\/([^/]+)\/sales\/token$/);
+if (mSaleTok && request.method === 'POST') {
+  const publicId = decodeURIComponent(mSaleTok[1]);
+  return handleSalesToken(publicId, request, env);
+}
+
+//pay
+// Stars: create invoice link
+const mStarsCreate = pathname.match(/^\/api\/public\/app\/([^/]+)\/stars\/create$/);
+if (mStarsCreate && request.method === 'POST') {
+  const publicId = decodeURIComponent(mStarsCreate[1]);
+  return handleStarsCreate(publicId, request, env);
+}
+
+// Stars: get order status
+const mStarsGet = pathname.match(/^\/api\/public\/app\/([^/]+)\/stars\/order\/([^/]+)$/);
+if (mStarsGet && request.method === 'GET') {
+  const publicId = decodeURIComponent(mStarsGet[1]);
+  const orderId = decodeURIComponent(mStarsGet[2]);
+  return handleStarsOrderGet(publicId, orderId, request, env);
+}
+
+
+
+
+      // Public events from miniapp
+      const mEvent = pathname.match(/^\/api\/public\/app\/([^/]+)\/event$/);
+      if (mEvent && request.method === 'POST') {
+        const publicId = decodeURIComponent(mEvent[1]);
+        return handlePublicEvent(publicId, request, env);
+      }
+
+      // Telegram webhook (Variant A): POST /api/tg/webhook/:publicId?s=...
+const mTg = pathname.match(/^\/api\/tg\/webhook\/([^/]+)$/);
+if (mTg && request.method === 'POST') {
+  const publicId = decodeURIComponent(mTg[1]);
+  return handleTelegramWebhook(publicId, request, env);
+}
+
+
+      /* ⬇️ ДОБАВИТЬ ВОТ ЭТО — мини-API для опубликованных мини-аппов */
+if (pathname.startsWith('/api/mini/')) {
+  return handleMiniApi(request, env, url);
+}
+
+// /app/:publicId (и /m/:publicId) — редиректим на публичный runtime на mini.salesgenius.ru
+if (pathname.startsWith('/app/') || pathname.startsWith('/m/')) {
+  const parts = pathname.split('/').filter(Boolean); // ['app', '<id>'] или ['m','<id>']
+  const publicId = parts[1] || '';
+  const target = 'https://mini.salesgenius.ru/m/' + encodeURIComponent(publicId);
+  return Response.redirect(target, 302);
+}
+
+
+      // Root
+      if (pathname === '/' && request.method === 'GET') {
+        return new Response('build-apps worker is alive', { status: 200 });
+      }
+
+      // ===== APPS AUTH API =====
+      // GET /api/templates — каталог шаблонов для создания проекта
+      if (pathname === '/api/templates' && request.method === 'GET') {
+        const s = await requireSession(request, env);
+        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+        return json({ ok:true, items: TEMPLATE_CATALOG }, 200, request);
+      }
+
+      // GET /api/my/apps
+      if (pathname === '/api/my/apps' && request.method === 'GET') {
+        const s = await requireSession(request, env);
+        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+        return listMyApps(env, s.uid, request);
+      }
+
+      // GET /api/apps  (alias for new sg-cabinet-react)
+if (pathname === '/api/apps' && request.method === 'GET') {
+  const s = await requireSession(request, env);
+  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+  return listMyApps(env, s.uid, request);
+}
+
+
+      // POST /api/app
+      if (request.method === 'POST' && pathname === '/api/app') {
+        const s = await requireSession(request, env);
+        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+        return createApp(request, env, url, s.uid);
+      }
+
+      // /api/app/:id GET/PUT
+      const appMatch = pathname.match(/^\/api\/app\/([^/]+)$/);
+      if (appMatch) {
+        const appId = decodeURIComponent(appMatch[1]);
+        const s = await requireSession(request, env);
+        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+
+        const ownerCheck = await ensureAppOwner(appId, s.uid, env);
+        if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
+
+        if (request.method === 'GET')  return getApp(appId, env, request);
+        if (request.method === 'PUT')  return saveApp(appId, request, env);
+        if (request.method === 'DELETE') return deleteApp(appId, env, request);
+      }
+
+      // POST /api/app/:id/publish
+      const pubMatch = pathname.match(/^\/api\/app\/([^/]+)\/publish$/);
+      if (pubMatch && request.method === 'POST') {
+        const appId = decodeURIComponent(pubMatch[1]);
+        const s = await requireSession(request, env);
+        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+
+        const ownerCheck = await ensureAppOwner(appId, s.uid, env);
+        if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
+
+        return publishApp(appId, env, url, request);
+      }
+      // /api/app/:id/bot GET/PUT/DELETE
+      const botMatch = pathname.match(/^\/api\/app\/([^/]+)\/bot$/);
+      if (botMatch) {
+        const appId = decodeURIComponent(botMatch[1]);
+        const s = await requireSession(request, env);
+        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+
+        const ownerCheck = await ensureAppOwner(appId, s.uid, env);
+        if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
+
+        if (request.method === 'DELETE') {
+          const body = await request.json().catch(() => ({}));
+          if (body.action === 'unlink') {
+            return deleteBotIntegration(appId, env, s.uid, request);
+          }
+          return json({ ok:false, error:'METHOD_NOT_ALLOWED' }, 405, request);
+        }
+
+        if (request.method === 'GET') {
+          return getBotIntegration(appId, env, s.uid, request);
+        }
+        
+
+        if (request.method === 'PUT') {
+          const body = await request.json().catch(() => ({}));
+          return saveBotIntegration(appId, env, body, s.uid, request);
+        }
+
+        return json({ ok:false, error:'METHOD_NOT_ALLOWED' }, 405, request);
+      }
+
+      // /api/app/:id/broadcasts GET  (список кампаний)
+const bcListMatch = pathname.match(/^\/api\/app\/([^/]+)\/broadcasts$/);
+if (bcListMatch && request.method === 'GET') {
+  const appId = decodeURIComponent(bcListMatch[1]);
+  const s = await requireSession(request, env);
+  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+
+  const ownerCheck = await ensureAppOwner(appId, s.uid, env);
+  if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
+
+  return listBroadcasts(appId, env, s.uid, request);
+}
+
+// /api/app/:id/broadcast POST (создать + отправить)
+const bcSendMatch = pathname.match(/^\/api\/app\/([^/]+)\/broadcast$/);
+if (bcSendMatch && request.method === 'POST') {
+  const appId = decodeURIComponent(bcSendMatch[1]);
+  const s = await requireSession(request, env);
+  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+
+  const ownerCheck = await ensureAppOwner(appId, s.uid, env);
+  if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
+
+  return createAndSendBroadcast(appId, env, s.uid, request);
+}
+
+// /api/app/:id/dialogs GET  (список диалогов)
+const dlgListMatch = pathname.match(/^\/api\/app\/([^/]+)\/dialogs$/);
+if (dlgListMatch && request.method === 'GET') {
+  const appId = decodeURIComponent(dlgListMatch[1]);
+
+  const s = await requireSession(request, env);
+  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+
+  const ownerCheck = await ensureAppOwner(appId, s.uid, env);
+  if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
+
+  return listDialogs(appId, env, s.uid, request);
+}
+
+// /api/app/:id/dialog/:tgUserId  GET (сообщения) / POST (отправка)
+const dlgMatch = pathname.match(/^\/api\/app\/([^/]+)\/dialog\/([^/]+)$/);
+if (dlgMatch) {
+  const appId = decodeURIComponent(dlgMatch[1]);
+  const tgUserId = decodeURIComponent(dlgMatch[2]);
+
+
+  const s = await requireSession(request, env);
+  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
+
+  const ownerCheck = await ensureAppOwner(appId, s.uid, env);
+  if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
+
+  if (request.method === 'GET')  return getDialogMessages(appId, tgUserId, env, s.uid, request);
+  if (request.method === 'POST') return sendDialogMessage(appId, tgUserId, env, s.uid, request);
+
+  return json({ ok:false, error:'METHOD_NOT_ALLOWED' }, 405, request);
+}
+
+
+  
+
 /**
 //  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ СЕКРЕТНЫХ ТОКЕНОВ БОТОВ
 // ======================================================
@@ -5645,249 +5893,7 @@ async function handleCabinetWheelPrizesUpdate(appId, request, env, ownerId){
 
 
 
-// ================== ОСНОВНОЙ WORKER ==================
-export async function legacyFetch(request: Request, env: any, ctx: ExecutionContext) {
 
-    const url = new URL(request.url);
-    if (url.pathname.startsWith('/blocks/')) {
-      if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: corsHeaders(request) });
-      }
-      if (request.method !== 'GET') {
-        return new Response('Method Not Allowed', { status: 405, headers: corsHeaders(request) });
-      }
-      return handleBlocksProxy(request, env); // ✅ env, не url
-    }
-    const pathname = url.pathname;
-
-    try {
-      if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: corsHeaders(request) });
-      }
-
-      // AUTH
-      if (pathname === '/api/auth/register' && request.method === 'POST') {
-        return handleRegister(request, env, url);
-      }
-      if (pathname === '/api/auth/login' && request.method === 'POST') {
-        return handleLogin(request, env);
-      }
-      if (pathname === '/api/auth/logout' && request.method === 'POST') {
-        return handleLogout(request);
-      }
-      if (pathname === '/api/auth/me' && request.method === 'GET') {
-        return handleMe(request, env);
-      }
-      if (pathname === '/api/auth/confirm' && request.method === 'GET') {
-        return handleConfirmEmail(url, env, request);
-      }
-
-      // Sales QR token (one-time)
-const mSaleTok = pathname.match(/^\/api\/public\/app\/([^/]+)\/sales\/token$/);
-if (mSaleTok && request.method === 'POST') {
-  const publicId = decodeURIComponent(mSaleTok[1]);
-  return handleSalesToken(publicId, request, env);
-}
-
-//pay
-// Stars: create invoice link
-const mStarsCreate = pathname.match(/^\/api\/public\/app\/([^/]+)\/stars\/create$/);
-if (mStarsCreate && request.method === 'POST') {
-  const publicId = decodeURIComponent(mStarsCreate[1]);
-  return handleStarsCreate(publicId, request, env);
-}
-
-// Stars: get order status
-const mStarsGet = pathname.match(/^\/api\/public\/app\/([^/]+)\/stars\/order\/([^/]+)$/);
-if (mStarsGet && request.method === 'GET') {
-  const publicId = decodeURIComponent(mStarsGet[1]);
-  const orderId = decodeURIComponent(mStarsGet[2]);
-  return handleStarsOrderGet(publicId, orderId, request, env);
-}
-
-
-
-
-      // Public events from miniapp
-      const mEvent = pathname.match(/^\/api\/public\/app\/([^/]+)\/event$/);
-      if (mEvent && request.method === 'POST') {
-        const publicId = decodeURIComponent(mEvent[1]);
-        return handlePublicEvent(publicId, request, env);
-      }
-
-      // Telegram webhook (Variant A): POST /api/tg/webhook/:publicId?s=...
-const mTg = pathname.match(/^\/api\/tg\/webhook\/([^/]+)$/);
-if (mTg && request.method === 'POST') {
-  const publicId = decodeURIComponent(mTg[1]);
-  return handleTelegramWebhook(publicId, request, env);
-}
-
-
-      /* ⬇️ ДОБАВИТЬ ВОТ ЭТО — мини-API для опубликованных мини-аппов */
-if (pathname.startsWith('/api/mini/')) {
-  return handleMiniApi(request, env, url);
-}
-
-// /app/:publicId (и /m/:publicId) — редиректим на публичный runtime на mini.salesgenius.ru
-if (pathname.startsWith('/app/') || pathname.startsWith('/m/')) {
-  const parts = pathname.split('/').filter(Boolean); // ['app', '<id>'] или ['m','<id>']
-  const publicId = parts[1] || '';
-  const target = 'https://mini.salesgenius.ru/m/' + encodeURIComponent(publicId);
-  return Response.redirect(target, 302);
-}
-
-
-      // Root
-      if (pathname === '/' && request.method === 'GET') {
-        return new Response('build-apps worker is alive', { status: 200 });
-      }
-
-      // ===== APPS AUTH API =====
-      // GET /api/templates — каталог шаблонов для создания проекта
-      if (pathname === '/api/templates' && request.method === 'GET') {
-        const s = await requireSession(request, env);
-        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-        return json({ ok:true, items: TEMPLATE_CATALOG }, 200, request);
-      }
-
-      // GET /api/my/apps
-      if (pathname === '/api/my/apps' && request.method === 'GET') {
-        const s = await requireSession(request, env);
-        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-        return listMyApps(env, s.uid, request);
-      }
-
-      // GET /api/apps  (alias for new sg-cabinet-react)
-if (pathname === '/api/apps' && request.method === 'GET') {
-  const s = await requireSession(request, env);
-  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-  return listMyApps(env, s.uid, request);
-}
-
-
-      // POST /api/app
-      if (request.method === 'POST' && pathname === '/api/app') {
-        const s = await requireSession(request, env);
-        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-        return createApp(request, env, url, s.uid);
-      }
-
-      // /api/app/:id GET/PUT
-      const appMatch = pathname.match(/^\/api\/app\/([^/]+)$/);
-      if (appMatch) {
-        const appId = decodeURIComponent(appMatch[1]);
-        const s = await requireSession(request, env);
-        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-
-        const ownerCheck = await ensureAppOwner(appId, s.uid, env);
-        if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
-
-        if (request.method === 'GET')  return getApp(appId, env, request);
-        if (request.method === 'PUT')  return saveApp(appId, request, env);
-        if (request.method === 'DELETE') return deleteApp(appId, env, request);
-      }
-
-      // POST /api/app/:id/publish
-      const pubMatch = pathname.match(/^\/api\/app\/([^/]+)\/publish$/);
-      if (pubMatch && request.method === 'POST') {
-        const appId = decodeURIComponent(pubMatch[1]);
-        const s = await requireSession(request, env);
-        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-
-        const ownerCheck = await ensureAppOwner(appId, s.uid, env);
-        if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
-
-        return publishApp(appId, env, url, request);
-      }
-      // /api/app/:id/bot GET/PUT/DELETE
-      const botMatch = pathname.match(/^\/api\/app\/([^/]+)\/bot$/);
-      if (botMatch) {
-        const appId = decodeURIComponent(botMatch[1]);
-        const s = await requireSession(request, env);
-        if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-
-        const ownerCheck = await ensureAppOwner(appId, s.uid, env);
-        if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
-
-        if (request.method === 'DELETE') {
-          const body = await request.json().catch(() => ({}));
-          if (body.action === 'unlink') {
-            return deleteBotIntegration(appId, env, s.uid, request);
-          }
-          return json({ ok:false, error:'METHOD_NOT_ALLOWED' }, 405, request);
-        }
-
-        if (request.method === 'GET') {
-          return getBotIntegration(appId, env, s.uid, request);
-        }
-        
-
-        if (request.method === 'PUT') {
-          const body = await request.json().catch(() => ({}));
-          return saveBotIntegration(appId, env, body, s.uid, request);
-        }
-
-        return json({ ok:false, error:'METHOD_NOT_ALLOWED' }, 405, request);
-      }
-
-      // /api/app/:id/broadcasts GET  (список кампаний)
-const bcListMatch = pathname.match(/^\/api\/app\/([^/]+)\/broadcasts$/);
-if (bcListMatch && request.method === 'GET') {
-  const appId = decodeURIComponent(bcListMatch[1]);
-  const s = await requireSession(request, env);
-  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-
-  const ownerCheck = await ensureAppOwner(appId, s.uid, env);
-  if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
-
-  return listBroadcasts(appId, env, s.uid, request);
-}
-
-// /api/app/:id/broadcast POST (создать + отправить)
-const bcSendMatch = pathname.match(/^\/api\/app\/([^/]+)\/broadcast$/);
-if (bcSendMatch && request.method === 'POST') {
-  const appId = decodeURIComponent(bcSendMatch[1]);
-  const s = await requireSession(request, env);
-  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-
-  const ownerCheck = await ensureAppOwner(appId, s.uid, env);
-  if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
-
-  return createAndSendBroadcast(appId, env, s.uid, request);
-}
-
-// /api/app/:id/dialogs GET  (список диалогов)
-const dlgListMatch = pathname.match(/^\/api\/app\/([^/]+)\/dialogs$/);
-if (dlgListMatch && request.method === 'GET') {
-  const appId = decodeURIComponent(dlgListMatch[1]);
-
-  const s = await requireSession(request, env);
-  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-
-  const ownerCheck = await ensureAppOwner(appId, s.uid, env);
-  if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
-
-  return listDialogs(appId, env, s.uid, request);
-}
-
-// /api/app/:id/dialog/:tgUserId  GET (сообщения) / POST (отправка)
-const dlgMatch = pathname.match(/^\/api\/app\/([^/]+)\/dialog\/([^/]+)$/);
-if (dlgMatch) {
-  const appId = decodeURIComponent(dlgMatch[1]);
-  const tgUserId = decodeURIComponent(dlgMatch[2]);
-
-
-  const s = await requireSession(request, env);
-  if (!s) return json({ ok:false, error:'UNAUTHORIZED' }, 401, request);
-
-  const ownerCheck = await ensureAppOwner(appId, s.uid, env);
-  if (!ownerCheck.ok) return json({ ok:false, error:'FORBIDDEN' }, ownerCheck.status, request);
-
-  if (request.method === 'GET')  return getDialogMessages(appId, tgUserId, env, s.uid, request);
-  if (request.method === 'POST') return sendDialogMessage(appId, tgUserId, env, s.uid, request);
-
-  return json({ ok:false, error:'METHOD_NOT_ALLOWED' }, 405, request);
-}
 
 
 // ===== CABINET (React panel) =====
