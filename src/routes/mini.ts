@@ -3,6 +3,8 @@ import type { Env } from "../index";
 import { json } from "../utils/http";
 import { tgSendMessage } from "../services/telegramSend";
 import { decryptToken } from "../services/crypto";
+import { getCanonicalPublicIdForApp } from "../services/apps";
+
 
 function safeJson(obj, maxLen = 8000) {
   try {
