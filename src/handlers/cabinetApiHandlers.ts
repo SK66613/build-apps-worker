@@ -317,6 +317,33 @@ export async function saveBotIntegration(appId: any, env: Env, body: any, ownerI
         .run();
     }
 
+        // ====== IMPORTANT: реально ставим webhook в Telegram, иначе апдейтов не будет ======
+    try {
+      const webhookUrl =
+        "https://app.salesgenius.ru/api/tg/webhook/" +
+        encodeURIComponent(appPublicId) +
+        "?s=" +
+        encodeURIComponent(wh.secret);
+
+      const r = await fetch(`https://api.telegram.org/bot${tokenRaw}/setWebhook`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          url: webhookUrl,
+          allowed_updates: ["message", "callback_query", "pre_checkout_query"],
+          drop_pending_updates: true,
+        }),
+      });
+
+      const j: any = await r.json().catch(() => null);
+      if (!r.ok || !j || !j.ok) {
+        console.error("[bot] setWebhook failed", r.status, j);
+      }
+    } catch (e) {
+      console.error("[bot] setWebhook exception", e);
+    }
+
+
     return json(
       {
         ok: true,
