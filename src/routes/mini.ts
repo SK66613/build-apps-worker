@@ -5,6 +5,15 @@ import { tgSendMessage } from "../services/telegramSend";
 import { decryptToken } from "../services/crypto";
 import { getCanonicalPublicIdForApp } from "../services/apps";
 
+/**
+ * ВАЖНОЕ исправление №1:
+ *  - правильный парсинг /api/mini/<publicId>/<type>
+ *  - больше НЕ используем .pop() для publicId (иначе publicId становился "state"/"spin" и т.п.)
+ *
+ * ВАЖНОЕ исправление №2:
+ *  - type тоже берём из 4-го сегмента (или из body/query) — без .pop() “как попало”
+ */
+
 function safeJson(obj: any, maxLen = 8000) {
   try {
     const s = JSON.stringify(obj);
@@ -116,6 +125,7 @@ async function requireTgAndVerify(publicId: string, initDataRaw: string | null, 
   if (!(ctx as any).ok) return ctx as any;
 
   const botToken = await getBotTokenForApp((ctx as any).publicId, env, (ctx as any).appId);
+  // Если токен есть — включаем строгую проверку initData
   if (botToken) {
     if (!initDataRaw) return { ok: false, status: 403, error: "NO_INIT_DATA" as const };
     const ok = await verifyInitDataSignature(initDataRaw, botToken);
@@ -209,7 +219,17 @@ async function passportCollectedCount(db: any, appPublicId: string, tgId: any) {
 }
 
 // ================== COINS ==================
-async function awardCoins(db: any, appId: any, appPublicId: string, tgId: any, delta: any, src: any, ref_id: any, note: any, event_id: any) {
+async function awardCoins(
+  db: any,
+  appId: any,
+  appPublicId: string,
+  tgId: any,
+  delta: any,
+  src: any,
+  ref_id: any,
+  note: any,
+  event_id: any
+) {
   if (event_id) {
     const ex = await db.prepare(`SELECT balance_after FROM coins_ledger WHERE event_id = ? LIMIT 1`).bind(event_id).first();
     if (ex) return { ok: true, reused: true, balance: Number((ex as any).balance_after || 0) };
@@ -223,14 +243,34 @@ async function awardCoins(db: any, appId: any, appPublicId: string, tgId: any, d
       `INSERT INTO coins_ledger (app_id, app_public_id, tg_id, event_id, src, ref_id, delta, balance_after, note)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .bind(appId, appPublicId, String(tgId), event_id || null, String(src || ""), String(ref_id || ""), Number(delta || 0), bal, String(note || ""))
+    .bind(
+      appId,
+      appPublicId,
+      String(tgId),
+      event_id || null,
+      String(src || ""),
+      String(ref_id || ""),
+      Number(delta || 0),
+      bal,
+      String(note || "")
+    )
     .run();
 
   await setUserCoins(db, appPublicId, tgId, bal);
   return { ok: true, balance: bal };
 }
 
-async function spendCoinsIfEnough(db: any, appId: any, appPublicId: string, tgId: any, cost: any, src: any, ref_id: any, note: any, event_id: any) {
+async function spendCoinsIfEnough(
+  db: any,
+  appId: any,
+  appPublicId: string,
+  tgId: any,
+  cost: any,
+  src: any,
+  ref_id: any,
+  note: any,
+  event_id: any
+) {
   cost = Math.max(0, Math.floor(Number(cost || 0)));
   if (cost <= 0) return { ok: true, spent: 0, balance: await getLastBalance(db, appPublicId, tgId) };
 
@@ -437,30 +477,95 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
     console.error("[passport.reward] tgSendMessage redeem failed", e);
   }
 
-  return { ok: true, issued: true, reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode }, got, total };
+  return {
+    ok: true,
+    issued: true,
+    reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode },
+    got,
+    total,
+  };
 }
 
 // ================== WHEEL ==================
 async function pickWheelPrize(db: any, appPublicId: string) {
   const rows = await db
-    .prepare(`SELECT code, title, weight, coins, active FROM wheel_prizes WHERE app_public_id = ?`)
+    .prepare(`SELECT code, title, weight, coins, active, img FROM wheel_prizes WHERE app_public_id = ?`)
     .bind(appPublicId)
     .all();
 
   const list = (rows.results || [])
     .filter((r: any) => Number(r.active || 0) && Number(r.weight || 0) > 0)
-    .map((r: any) => ({ code: String(r.code), title: String(r.title || r.code), weight: Number(r.weight), coins: Number(r.coins || 0), img: r.img || "" }));
+    .map((r: any) => ({
+      code: String(r.code),
+      title: String(r.title || r.code),
+      weight: Number(r.weight),
+      coins: Number(r.coins || 0),
+      img: String((r as any).img || ""),
+    }));
 
   if (!list.length) return null;
 
   const sum = list.reduce((a: number, b: any) => a + b.weight, 0);
-  let rnd = Math.random() * sum,
-    acc = 0;
+  let rnd = Math.random() * sum;
+  let acc = 0;
   for (const it of list) {
     acc += it.weight;
     if (rnd <= acc) return it;
   }
   return list[list.length - 1];
+}
+
+async function ensureWheelRedeem(
+  db: any,
+  ctx: any,
+  tgId: any,
+  spinId: number,
+  prize: { code: string; title: string; coins: number }
+) {
+  // если уже есть redeem — вернём его
+  const ex = await db
+    .prepare(
+      `SELECT id, redeem_code, status, issued_at, redeemed_at
+       FROM wheel_redeems
+       WHERE app_public_id=? AND spin_id=?
+       LIMIT 1`
+    )
+    .bind(ctx.publicId, spinId)
+    .first();
+
+  if (ex) {
+    return {
+      redeem_code: String((ex as any).redeem_code || ""),
+      status: String((ex as any).status || "issued"),
+      issued_at: (ex as any).issued_at || "",
+      redeemed_at: (ex as any).redeemed_at || "",
+      reused: true,
+    };
+  }
+
+  // создаём новый redeem
+  let redeemCode = "";
+  for (let i = 0; i < 8; i++) {
+    redeemCode = randomRedeemCode(10);
+    try {
+      await db
+        .prepare(
+          `INSERT INTO wheel_redeems
+           (app_id, app_public_id, tg_id, spin_id, prize_code, prize_title, coins, redeem_code, status, issued_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
+        )
+        .bind(ctx.appId, ctx.publicId, String(tgId), spinId, prize.code, prize.title, Number(prize.coins || 0), redeemCode)
+        .run();
+      break;
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (/unique|constraint/i.test(msg)) continue;
+      throw e;
+    }
+  }
+
+  if (!redeemCode) throw new Error("WHEEL_REDEEM_CREATE_FAILED");
+  return { redeem_code: redeemCode, status: "issued", issued_at: nowISO(), redeemed_at: "", reused: false };
 }
 
 // ================== QUIZ ==================
@@ -599,7 +704,7 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
     passport_reward: null,
   };
 
-  // bot username for referral links (active bot)
+  // bot username (active bot)
   try {
     const pid = String(appPublicId || "").trim();
     const b = await db
@@ -631,7 +736,7 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
       `SELECT prize_id, prize_name, prize_value, ts
        FROM bonus_claims
        WHERE app_public_id = ? AND tg_id = ?
-       AND (claim_status IS NULL OR claim_status = 'ok')
+       AND (claim_status IS NULL OR claim_status = 'ok' OR claim_status = 'pending')
        ORDER BY id DESC LIMIT 10`
     )
     .bind(appPublicId, String(tgId))
@@ -661,8 +766,8 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
     ts: r.ts || "",
   }));
 
-  let lastTs = 0,
-    lastSid = "";
+  let lastTs = 0;
+  let lastSid = "";
   const seen = new Set<string>();
 
   for (const r of su.results || []) {
@@ -730,7 +835,7 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
     QUIZ_COINS_MAX_PER_SUBMIT: Number(cfg?.QUIZ_COINS_MAX_PER_SUBMIT || 0),
     STYLE_COLLECT_COINS: Number(cfg?.STYLE_COLLECT_COINS || 0),
     LEADERBOARD_TOP_N: topN,
-    WHEEL_SPIN_COST: Number(cfg?.WHEEL_SPIN_COST || 0),
+    WHEEL_SPIN_COST: Number(cfg?.WHEEL_SPIN_COST ?? cfg?.SPIN_COST ?? 0),
     WHEEL_CLAIM_COOLDOWN_H: cdH,
   };
 
@@ -780,14 +885,21 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
   }
 
   out.ref_total = await refsTotal(db, appPublicId, tgId);
-
   return out;
 }
 
 // ================== MINI API ==================
+function parseMiniPath(url: URL) {
+  const parts = (url.pathname || "").split("/").filter(Boolean);
+  // ожидаем: /api/mini/<publicId>/<type>
+  const isMini = parts[0] === "api" && parts[1] === "mini";
+  const pathPublicId = isMini && parts[2] ? String(parts[2]) : "";
+  const pathType = isMini && parts[3] ? String(parts[3]) : "";
+  return { pathPublicId, pathType };
+}
+
 async function handleMiniApi(request: Request, env: Env, url: URL) {
   const db: any = env.DB;
-  const publicId = url.searchParams.get("public_id") || (url.pathname || "").split("/").pop() || "";
 
   // читаем JSON
   let body: any = {};
@@ -795,8 +907,30 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     body = await request.json();
   } catch (_) {}
 
+  const { pathPublicId, pathType } = parseMiniPath(url);
+
+  // ✅ FIX: publicId НЕ через .pop()
+  const publicId =
+    String(url.searchParams.get("public_id") || "") ||
+    String(body.public_id || body.publicId || "") ||
+    pathPublicId ||
+    "";
+
+  // ✅ FIX: type НЕ через .pop()
+  let type =
+    String(body.type || "") ||
+    String(url.searchParams.get("type") || "") ||
+    pathType ||
+    "";
+
+  // совместимость алиасов
+  if (type === "claim") type = "claim_prize";
+  if (type === "quiz") type = "quiz_state";
+
   const initDataRaw = body.init_data || body.initData || null;
   const tg = body.tg_user || {};
+
+  if (!publicId) return json({ ok: false, error: "NO_PUBLIC_ID" }, 400, request);
   if (!tg || !tg.id) return json({ ok: false, error: "NO_TG_USER_ID" }, 400, request);
 
   const ctx = await requireTgAndVerify(publicId, initDataRaw, env);
@@ -804,21 +938,16 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
 
   await upsertAppUser(db, (ctx as any).appId, (ctx as any).publicId, tg);
 
-  // type resolution
-  let type = body.type || url.searchParams.get("type") || "";
-  if (!type) {
-    const seg = (url.pathname || "").split("/").filter(Boolean).pop();
-    type = seg || "";
-  }
-  if (type === "claim") type = "claim_prize";
-  if (type === "quiz") type = "quiz_state";
-
   const payload = body.payload || {};
 
   // ====== state
   if (type === "state") {
     const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
-    const cfg = (appObj as any) && ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config) ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config) : {};
+    const cfg =
+      (appObj as any) &&
+      ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+        ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+        : {};
 
     // referral start_param
     let startParam = "";
@@ -842,6 +971,135 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     return json(res, 200, request);
   }
 
+  // ====== wheel.spin
+  if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
+    const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
+    const cfg =
+      (appObj as any) &&
+      ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+        ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+        : {};
+
+    const cost = Number(cfg?.WHEEL_SPIN_COST ?? cfg?.SPIN_COST ?? 0);
+    const spend = await spendCoinsIfEnough(
+      db,
+      (ctx as any).appId,
+      (ctx as any).publicId,
+      tg.id,
+      cost,
+      "wheel_spin",
+      "",
+      "wheel spin cost",
+      `wheel:spin:${(ctx as any).publicId}:${tg.id}:${Date.now()}:${cost}`
+    );
+
+    if (!(spend as any).ok) return json(spend, 400, request);
+
+    const prize = await pickWheelPrize(db, (ctx as any).publicId);
+    if (!prize) return json({ ok: false, error: "NO_WHEEL_PRIZES" }, 400, request);
+
+    const ins = await db
+      .prepare(
+        `INSERT INTO wheel_spins (app_id, app_public_id, tg_id, status, prize_code, prize_title, coins, ts_spin)
+         VALUES (?, ?, ?, 'won', ?, ?, ?, datetime('now'))`
+      )
+      .bind((ctx as any).appId, (ctx as any).publicId, String(tg.id), prize.code, prize.title, Number(prize.coins || 0))
+      .run();
+
+    const spinId = Number((ins as any).lastInsertRowid || 0);
+
+    // бонус-лог (pending, если монеты/приз подтверждаются позже)
+    try {
+      await db
+        .prepare(
+          `INSERT INTO bonus_claims (app_id, app_public_id, tg_id, prize_id, prize_name, prize_value, claim_status)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending')`
+        )
+        .bind((ctx as any).appId, (ctx as any).publicId, String(tg.id), prize.code, prize.title, Number(prize.coins || 0))
+        .run();
+    } catch (_) {}
+
+    const fresh = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
+    return json({ ok: true, spin_id: spinId, prize, balance: (spend as any).balance, fresh_state: fresh }, 200, request);
+  }
+
+  // ====== wheel.claim_prize (создать redeem-код/ссылку для кассира)
+  if (type === "claim_prize" || type === "wheel.claim" || type === "wheel_claim") {
+    const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
+    const cfg =
+      (appObj as any) &&
+      ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+        ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+        : {};
+
+    const lastWon = await db
+      .prepare(
+        `SELECT id, prize_code, prize_title, coins
+         FROM wheel_spins
+         WHERE app_public_id = ? AND tg_id = ? AND status='won'
+         ORDER BY id DESC LIMIT 1`
+      )
+      .bind((ctx as any).publicId, String(tg.id))
+      .first();
+
+    if (!lastWon) return json({ ok: false, error: "NO_UNCLAIMED_PRIZE" }, 400, request);
+
+    const spinId = Number((lastWon as any).id);
+    const prize = {
+      code: String((lastWon as any).prize_code || ""),
+      title: String((lastWon as any).prize_title || ""),
+      coins: Math.max(0, Math.floor(Number((lastWon as any).coins || 0))),
+    };
+
+    const rr = await ensureWheelRedeem(db, ctx, tg.id, spinId, prize);
+
+    // (опционально) отправим сообщение в бота с кодом/ссылкой
+    try {
+      const botToken = await getBotTokenForApp((ctx as any).publicId, env, (ctx as any).appId).catch(() => null);
+      if (botToken) {
+        let botUsername = "";
+        try {
+          const b = await db
+            .prepare(
+              `SELECT username FROM bots
+               WHERE app_public_id = ? AND status='active'
+               ORDER BY id DESC LIMIT 1`
+            )
+            .bind((ctx as any).publicId)
+            .first();
+          botUsername = b && (b as any).username ? String((b as any).username).replace(/^@/, "").trim() : "";
+        } catch (_) {}
+
+        const deepLink = botUsername ? `https://t.me/${botUsername}?start=redeem_${encodeURIComponent(rr.redeem_code)}` : "";
+
+        const lines = [
+          `🎁 Приз: <b>${prize.title}</b>`,
+          prize.coins > 0 ? `🪙 Монеты: <b>${prize.coins}</b> (после подтверждения кассиром)` : "",
+          ``,
+          `✅ Код выдачи: <code>${rr.redeem_code}</code>`,
+          deepLink ? `Откройте ссылку:\n${deepLink}` : `Покажите код кассиру.`,
+        ].filter(Boolean);
+
+        await tgSendMessage(env, botToken, String(tg.id), lines.join("\n"), {}, { appPublicId: (ctx as any).publicId, tgUserId: String(tg.id) });
+      }
+    } catch (e) {
+      console.error("[wheel.claim] tgSendMessage failed", e);
+    }
+
+    const fresh = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
+    return json(
+      {
+        ok: true,
+        spin_id: spinId,
+        prize,
+        redeem: { redeem_code: rr.redeem_code, status: rr.status, issued_at: rr.issued_at },
+        fresh_state: fresh,
+      },
+      200,
+      request
+    );
+  }
+
   // ====== style collect
   if (type === "style.collect" || type === "style_collect") {
     const styleId = String((payload && (payload.style_id || payload.styleId || payload.code)) || "").trim();
@@ -849,7 +1107,12 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     if (!styleId) return json({ ok: false, error: "NO_STYLE_ID" }, 400, request);
 
     const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
-    const cfg = (appObj as any) && ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config) ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config) : {};
+    const cfg =
+      (appObj as any) &&
+      ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+        ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+        : {};
+
     const requirePin = !!(cfg && cfg.passport && cfg.passport.require_pin);
 
     if (requirePin) {
@@ -893,7 +1156,7 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     return json(res, (res as any).ok ? 200 : 400, request);
   }
 
-  // ====== calendar.* (оставил как у тебя — без изменений логики)
+  // ====== calendar.free_slots (оставил как у тебя, логика без изменений)
   if (type === "calendar.free_slots" || type === "calendar_free_slots") {
     const p = (body && body.payload) || {};
     const date = p.date && /^\d{4}-\d{2}-\d{2}$/.test(p.date) ? p.date : new Date().toISOString().slice(0, 10);
@@ -963,9 +1226,7 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     return json({ ok: true, date, slots }, 200, request);
   }
 
-  // остальное (spin/claim/game_submit и т.д.) — у тебя уже есть, просто не влезает сюда без тонны текста.
-  // Если надо — я пришлю “расширенную” версию с wheel/game целиком отдельным файлом.
-  return json({ ok: false, error: "UNKNOWN_TYPE" }, 400, request);
+  return json({ ok: false, error: "UNKNOWN_TYPE", type }, 400, request);
 }
 
 export async function routeMiniApi(request: Request, env: Env, url: URL): Promise<Response> {
