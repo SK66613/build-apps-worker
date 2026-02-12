@@ -95,6 +95,28 @@ export async function handleStarsOrderGet(publicId: string, orderId: string | nu
 // ================== Public config ==================
 
 export async function getPublicConfig(publicId: string, env: Env, request: Request): Promise<Response> {
+  // 0) сперва пробуем LIVE (то, что должно отдавать боевое мини)
+  try{
+    const liveRaw = await env.APPS.get('app:live:' + publicId);
+    if (liveRaw) {
+      let liveCfg: any = null;
+      try { liveCfg = JSON.parse(liveRaw); } catch(_e) { liveCfg = null; }
+
+      // source поможет быстро понимать что отдаём
+      const payload = {
+        publicId,
+        title: (liveCfg && liveCfg?.app?.title) ? String(liveCfg.app.title) : undefined,
+        config: liveCfg,
+        source: 'live',
+      };
+
+      return jsonResponse({ ok: true, ...payload, app: payload }, 200, request);
+    }
+  }catch(e){
+    console.warn('[public/config] live read failed', e);
+  }
+
+  // 1) fallback: legacy (старое поведение)
   const map: any = await env.APPS.get('app:by_public:' + publicId, 'json');
   if (!map || !map.appId) {
     return jsonResponse({ ok: false, error: 'NOT_FOUND' }, 404, request);
@@ -110,10 +132,12 @@ export async function getPublicConfig(publicId: string, env: Env, request: Reque
     publicId,
     title: appObj.title,
     config: appObj.config,
+    source: 'legacy',
   };
 
   return jsonResponse({ ok: true, ...payload, app: payload }, 200, request);
 }
+
 
 // ================== Public events (mini-app -> D1) ==================
 
