@@ -4,7 +4,6 @@ on:
   push:
     branches: ["main"]
 
-# не держим очередь — отменяем старые деплои если ты пушишь часто
 concurrency:
   group: build-apps-worker-main
   cancel-in-progress: true
@@ -20,23 +19,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          # ускоряет npm install за счёт кеша
           cache: "npm"
 
-      # кеш wrangler/miniflare/workerd, чтобы не тащить их каждый раз
-      - name: Cache Wrangler/Miniflare
+      # Кеш именно того, что Wrangler/Miniflare качают тяжёлого
+      - name: Cache Wrangler/Workerd/Miniflare
         uses: actions/cache@v4
         with:
           path: |
-            ~/.npm
-            ~/.cache
             ~/.wrangler
-            node_modules/.cache
-          key: ${{ runner.os }}-wrangler-${{ hashFiles('package-lock.json', 'package.json') }}
+            ~/.cache
+          key: ${{ runner.os }}-wrangler-${{ hashFiles('package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-wrangler-
 
-      # ВАЖНО: если есть package-lock.json — используем npm ci (быстрее и стабильнее)
       - name: Install deps
         run: |
           if [ -f package-lock.json ]; then
@@ -45,9 +40,8 @@ jobs:
             npm install --prefer-offline --no-audit --no-fund
           fi
 
-      # (необязательно, но ускоряет) отключаем лишнее в CI
       - name: Deploy
-        run: npx wrangler deploy --log-level warn
+        run: npx wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CI: "true"
