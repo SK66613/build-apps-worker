@@ -8,11 +8,7 @@ import { resolveAppContextByPublicId } from "../services/apps";
 import { tgAnswerPreCheckoutQuery, tgAnswerCallbackQuery } from "../services/telegramApi";
 import { tgSendMessage } from "../services/telegramSend";
 
-// ⚠️ Эти функции у тебя уже используются ниже. Если у тебя пути другие — поправь импорты под свой проект.
-import { awardCoins } from "../services/coins";
-import { issuePinToCustomer } from "../services/pins";
-import { saleTokKey } from "../services/sales";
-import { buildState } from "../services/state";
+
 
 async function getSalesSettings(db: any, appPublicId: string) {
   try {
