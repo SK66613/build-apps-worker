@@ -1,7 +1,5 @@
 // src/routes/cabinet.ts
 // Cabinet (cookie session) API router.
-// Пока логика живёт в legacy/legacyFetch.ts, но роутинг вынесен сюда,
-// чтобы постепенно вырезать legacy router.
 
 import type { Env } from "../index";
 import {
@@ -27,46 +25,53 @@ import { json } from "../utils/http";
 export async function routeCabinet(request: Request, env: Env, url: URL): Promise<Response | null> {
   const p = url.pathname;
 
-  // ===== constructor blueprint config (KV) =====
+  // ===== constructor blueprint config (DRAFT KV) =====
   // GET/PUT /api/app/:id/config
   const mAppCfg = p.match(/^\/api\/app\/([^/]+)\/config$/);
   if (mAppCfg) {
     const appId = decodeURIComponent(mAppCfg[1]);
+
     const s = await requireSession(request as any, env as any);
     if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
 
     const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status || 403, request);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status || 403, request);
 
-    const key = "app:" + appId;
-const draftKey = "app:draft:" + appId;
+    const metaKey = "app:" + appId;
+    const draftKey = "app:draft:" + appId;
 
-if (request.method === "GET") {
-  // 1) сначала пробуем draft
-  const draft = await env.APPS.get(draftKey, "json");
-  if (draft) return json({ ok: true, config: draft }, 200, request);
+    // ===== GET draft blueprint =====
+    if (request.method === "GET") {
+      // 1️⃣ сначала пробуем новый draft
+      const draft = await env.APPS.get(draftKey, "json");
+      if (draft) {
+        return json({ ok: true, config: draft }, 200, request);
+      }
 
-  // 2) fallback на старый формат (чтобы старые проекты не сломались)
-  const appObj = (await env.APPS.get(key, "json")) || {};
-  return json({ ok: true, config: (appObj as any).config ?? null }, 200, request);
-}
+      // 2️⃣ fallback — старый config (для старых приложений)
+      const appObj = (await env.APPS.get(metaKey, "json")) || {};
+      return json({ ok: true, config: (appObj as any).config ?? null }, 200, request);
+    }
 
+    // ===== SAVE draft blueprint =====
+    if (request.method === "PUT") {
+      const body: any = await request.json().catch(() => ({}));
+      const bp = body?.config || body?.blueprint || body?.bp || null;
 
-if (request.method === "PUT") {
-  const body: any = await request.json().catch(() => ({}));
-  const bp = body?.config || body?.blueprint || body?.bp || null;
+      // записываем ТОЛЬКО draft
+      await env.APPS.put(draftKey, JSON.stringify(bp));
 
-  // пишем ТОЛЬКО draft
-  await env.APPS.put(draftKey, JSON.stringify(bp));
+      // обновляем timestamp meta (не трогаем config!)
+      const appObj = (await env.APPS.get(metaKey, "json")) || {};
+      (appObj as any).updatedAt = new Date().toISOString();
+      await env.APPS.put(metaKey, JSON.stringify(appObj));
 
-  // (опционально) обновим updatedAt у app meta, но НЕ трогаем appObj.config
-  const appObj = (await env.APPS.get(key, "json")) || {};
-  (appObj as any).updatedAt = new Date().toISOString();
-  await env.APPS.put(key, JSON.stringify(appObj));
+      return json({ ok: true }, 200, request);
+    }
 
-  return json({ ok: true }, 200, request);
-}
-
+    return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
+  }
 
 
   // ===== apps list =====
@@ -91,11 +96,13 @@ if (request.method === "PUT") {
     if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
 
     const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
 
     if (request.method === "GET") return getApp(appId, env as any, request);
     if (request.method === "PUT") return saveApp(appId, request as any, env as any);
     if (request.method === "DELETE") return deleteApp(appId, env as any, request);
+
     return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
   }
 
@@ -103,12 +110,15 @@ if (request.method === "PUT") {
   const mPub = p.match(/^\/api\/app\/([^/]+)\/publish$/);
   if (mPub && request.method === "POST") {
     const appId = decodeURIComponent(mPub[1]);
+
     const s = await requireSession(request as any, env as any);
     if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
 
     const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
 
+    // publishApp внутри уже копирует draft -> live
     return publishApp(appId, env as any, url as any, request);
   }
 
@@ -120,9 +130,11 @@ if (request.method === "PUT") {
     if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
 
     const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
 
-    if (request.method === "GET") return getBotIntegration(appId, env as any, s.uid, request);
+    if (request.method === "GET")
+      return getBotIntegration(appId, env as any, s.uid, request);
 
     if (request.method === "PUT") {
       const body = await request.json().catch(() => ({}));
@@ -131,7 +143,8 @@ if (request.method === "PUT") {
 
     if (request.method === "DELETE") {
       const body = await request.json().catch(() => ({}));
-      if (body.action === "unlink") return deleteBotIntegration(appId, env as any, s.uid, request);
+      if (body.action === "unlink")
+        return deleteBotIntegration(appId, env as any, s.uid, request);
       return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
     }
 
@@ -146,7 +159,8 @@ if (request.method === "PUT") {
     if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
 
     const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
 
     return listBroadcasts(appId, env as any, s.uid, request);
   }
@@ -158,7 +172,8 @@ if (request.method === "PUT") {
     if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
 
     const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
 
     return createAndSendBroadcast(appId, env as any, s.uid, request);
   }
@@ -171,7 +186,8 @@ if (request.method === "PUT") {
     if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
 
     const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
 
     return listDialogs(appId, env as any, s.uid, request);
   }
@@ -184,10 +200,15 @@ if (request.method === "PUT") {
     if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
 
     const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
 
-    if (request.method === "GET") return getDialogMessages(appId, tgUserId, env as any, s.uid, request);
-    if (request.method === "POST") return sendDialogMessage(appId, tgUserId, env as any, s.uid, request);
+    if (request.method === "GET")
+      return getDialogMessages(appId, tgUserId, env as any, s.uid, request);
+
+    if (request.method === "POST")
+      return sendDialogMessage(appId, tgUserId, env as any, s.uid, request);
+
     return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
   }
 
