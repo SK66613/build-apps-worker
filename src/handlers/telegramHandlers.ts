@@ -114,18 +114,13 @@ function saleTokKey(token: string) {
   return `sale_tok:${String(token || "").trim()}`;
 }
 
+// ================== PINs (MONOLITH COMPAT) ==================
 
-
-/**
- * Creates/updates pin in pins_pool, binds it to customer + style.
- * Requires tables: pins_pool(app_public_id, pin, cashier_tg_id, customer_tg_id, style_id, status, created_at, used_at, used_by_tg, expires_at)
- * If your schema differs, errors will be logged clearly.
- */
 function randomPin4() {
   return String(Math.floor(1000 + Math.random() * 9000)); // 1000..9999
 }
 
-// ⚠️ ВАЖНО: это 1:1 как в монолите (pins_pool: target_tg_id + issued_by_tg + issued_at)
+// 1:1 как в монолите (pins_pool: target_tg_id + issued_by_tg + issued_at)
 async function issuePinToCustomer(
   db: any,
   appPublicId: string,
@@ -162,7 +157,7 @@ async function issuePinToCustomer(
         appPublicId,
         cashierTgId,
         customerTgId,
-        styleId,
+        styleId
       });
       return { ok: false, error: "PIN_DB_ERROR" };
     }
@@ -353,7 +348,6 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
   try {
     const expected = await getBotWebhookSecretForPublicId(publicId, env);
     if (!expected || !timingSafeEqual(s, expected)) {
-      // Forbidden can be 403 (Telegram will stop), but you want it strict:
       return new Response("FORBIDDEN", { status: 403 });
     }
 
@@ -504,7 +498,299 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
         }
       }
 
-      // 1) CANCEL CASHBACK
+      async function loadRedeemAction(key: string) {
+        const k = `redeem_action:${appPublicId}:${String(key || "")}:${cashierTgId}`;
+        const raw = env.BOT_SECRETS ? await env.BOT_SECRETS.get(k) : null;
+        if (!raw) return null;
+        try {
+          return JSON.parse(raw);
+        } catch (_) {
+          return null;
+        }
+      }
+
+      // 0) SALE CONFIRM (new)
+      if (data.startsWith("sale_confirm:")) {
+        const saleId = data.slice("sale_confirm:".length).trim();
+        const act = await loadSaleAction(saleId);
+
+        if (!act || !act.customerTgId) {
+          await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
+          return new Response("OK", { status: 200 });
+        }
+
+        const actAppPublicId = String(act.appPublicId || appPublicId);
+        const cashbackCoins = Math.max(0, Math.floor(Number(act.cashbackCoins || 0)));
+        const cbp = Math.max(0, Math.min(100, Number(act.cashback_percent || 0)));
+
+        if (act.customerTgId && cashbackCoins > 0) {
+          await awardCoins(
+            env.DB,
+            appId,
+            actAppPublicId,
+            String(act.customerTgId),
+            cashbackCoins,
+            "sale_cashback_confirmed",
+            String(act.saleId || saleId),
+            `Кэшбэк ${cbp}% за покупку`,
+            `sale_confirm:${actAppPublicId}:${String(act.saleId || saleId)}`
+          );
+
+          try {
+            await tgSendMessage(
+              env,
+              botToken,
+              String(act.customerTgId),
+              `🎉 Кассир подтвердил кэшбэк!\nНачислено <b>${cashbackCoins}</b> монет ✅`,
+              {},
+              { appPublicId: actAppPublicId, tgUserId: String(act.customerTgId) }
+            );
+          } catch (_) {}
+        }
+
+        await tgSendMessage(
+          env,
+          botToken,
+          String(chatId),
+          `✅ Кэшбэк подтверждён.\nSale #${String(act.saleId || saleId)}\nКэшбэк: ${cashbackCoins} монет`,
+          {},
+          { appPublicId: actAppPublicId, tgUserId: cashierTgId }
+        );
+
+        await tgAnswerCallbackQuery(botToken, cqId, "Подтверждено ✅", false);
+        return new Response("OK", { status: 200 });
+      }
+
+      if (data.startsWith("sale_decline:")) {
+        const saleId = data.slice("sale_decline:".length).trim();
+        const act = await loadSaleAction(saleId);
+
+        if (!act || !act.customerTgId) {
+          await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
+          return new Response("OK", { status: 200 });
+        }
+
+        const actAppPublicId = String(act.appPublicId || appPublicId);
+
+        await tgSendMessage(
+          env,
+          botToken,
+          String(chatId),
+          `⛔️ Кэшбэк НЕ выдан (отменено).\nSale #${String(act.saleId || saleId)}.`,
+          {},
+          { appPublicId: actAppPublicId, tgUserId: cashierTgId }
+        );
+
+        try {
+          await tgSendMessage(
+            env,
+            botToken,
+            String(act.customerTgId),
+            `ℹ️ Кэшбэк по покупке не подтверждён кассиром.`,
+            {},
+            { appPublicId: actAppPublicId, tgUserId: String(act.customerTgId) }
+          );
+        } catch (_) {}
+
+        await tgAnswerCallbackQuery(botToken, cqId, "Отменено", false);
+        return new Response("OK", { status: 200 });
+      }
+
+      // 0b) REDEEM CONFIRM/DECLINE (new)
+      if (data.startsWith("redeem_confirm:")) {
+        const redeemCode = data.slice("redeem_confirm:".length).trim();
+        const act = await loadRedeemAction(redeemCode);
+
+        if (!act || !act.redeemCode) {
+          await tgAnswerCallbackQuery(botToken, cqId, "Контекст приза не найден (истёк).", true);
+          return new Response("OK", { status: 200 });
+        }
+
+        // WHEEL
+        if (act.kind === "wheel") {
+          const r: any = await env.DB.prepare(
+            `SELECT id, tg_id, prize_code, prize_title, status
+             FROM wheel_redeems
+             WHERE app_public_id=? AND redeem_code=?
+             LIMIT 1`
+          ).bind(appPublicId, redeemCode).first();
+
+          if (!r) {
+            await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: from.id });
+            return new Response("OK", { status: 200 });
+          }
+          if (String(r.status) === "redeemed") {
+            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
+            return new Response("OK", { status: 200 });
+          }
+
+          // coins по wheel_prizes
+          let coins = 0;
+          try {
+            const pr: any = await env.DB.prepare(
+              `SELECT coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`
+            ).bind(appPublicId, String(r.prize_code || "")).first();
+            coins = Math.max(0, Math.floor(Number(pr?.coins || 0)));
+          } catch (_) {}
+
+          if (coins > 0) {
+            await awardCoins(
+              env.DB,
+              appId,
+              appPublicId,
+              String(r.tg_id),
+              coins,
+              "wheel_redeem_confirmed",
+              String(redeemCode),
+              String(r.prize_title || "Wheel prize"),
+              `wheel:redeem:${appPublicId}:${String(r.tg_id)}:${String(r.id)}:${coins}`
+            );
+          }
+
+          await env.DB.prepare(
+            `UPDATE wheel_redeems
+             SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
+             WHERE id=? AND status='issued'`
+          ).bind(String(from.id), Number(r.id)).run();
+
+          try {
+            await env.DB.prepare(
+              `UPDATE wheel_spins
+               SET status='redeemed', ts_redeemed=datetime('now'), redeemed_by_tg=?
+               WHERE app_public_id=? AND redeem_id=?`
+            ).bind(String(from.id), appPublicId, Number(r.id)).run();
+          } catch (_) {}
+
+          await tgSendMessage(
+            env,
+            botToken,
+            String(chatId),
+            `✅ Выдача подтверждена.\nКод: <code>${redeemCode}</code>\nПриз: <b>${String(r.prize_title || "")}</b>` +
+              (coins > 0 ? `\n🪙 Начислено: <b>${coins}</b>` : ""),
+            {},
+            { appPublicId, tgUserId: from.id }
+          );
+
+          try {
+            await tgSendMessage(
+              env,
+              botToken,
+              String(r.tg_id),
+              `🎉 Кассир подтвердил выдачу!\n<b>${String(r.prize_title || "")}</b>` +
+                (coins > 0 ? `\n🪙 Начислено <b>${coins}</b> монет.` : ""),
+              {},
+              { appPublicId, tgUserId: String(r.tg_id) }
+            );
+          } catch (_) {}
+
+          await tgAnswerCallbackQuery(botToken, cqId, "Подтверждено ✅", false);
+          return new Response("OK", { status: 200 });
+        }
+
+        // PASSPORT
+        if (act.kind === "passport") {
+          const pr: any = await env.DB.prepare(
+            `SELECT id, tg_id, prize_code, prize_title, coins, status
+             FROM passport_rewards
+             WHERE app_public_id=? AND redeem_code=?
+             ORDER BY id DESC
+             LIMIT 1`
+          ).bind(appPublicId, redeemCode).first();
+
+          if (!pr) {
+            await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: from.id });
+            return new Response("OK", { status: 200 });
+          }
+
+          if (String(pr.status) === "redeemed") {
+            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
+            return new Response("OK", { status: 200 });
+          }
+
+          const updRes = await env.DB.prepare(
+            `UPDATE passport_rewards
+             SET status='redeemed',
+                 redeemed_at=datetime('now'),
+                 redeemed_by_tg=?
+             WHERE id=? AND status='issued'`
+          ).bind(String(from.id), Number(pr.id)).run();
+
+          if (!updRes || !(updRes as any).meta || !(updRes as any).meta.changes) {
+            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
+            return new Response("OK", { status: 200 });
+          }
+
+          const coins = Math.max(0, Math.floor(Number(pr.coins || 0)));
+          if (coins > 0) {
+            try {
+              await awardCoins(
+                env.DB,
+                appId,
+                appPublicId,
+                String(pr.tg_id),
+                coins,
+                "passport_complete_redeemed",
+                String(pr.prize_code || ""),
+                String(pr.prize_title || "Паспорт: приз"),
+                `passport:redeem:${appPublicId}:${String(pr.tg_id)}:${String(pr.id)}:${coins}`
+              );
+            } catch (e) {
+              logEvt("error", "passport.redeem_awardCoins_failed", { err: errObj(e), appPublicId, redeemCode });
+            }
+          }
+
+          // reset passport
+          try {
+            await env.DB.prepare(`DELETE FROM styles_user WHERE app_public_id=? AND tg_id=?`)
+              .bind(appPublicId, String(pr.tg_id))
+              .run();
+          } catch (_) {}
+
+          await tgSendMessage(
+            env,
+            botToken,
+            String(chatId),
+            `✅ Выдача подтверждена.\nКод: <code>${redeemCode}</code>\nПриз: <b>${String(pr.prize_title || "")}</b>` +
+              (coins > 0 ? `\n🪙 Начислено: <b>${coins}</b>` : ""),
+            {},
+            { appPublicId, tgUserId: from.id }
+          );
+
+          try {
+            await tgSendMessage(
+              env,
+              botToken,
+              String(pr.tg_id),
+              `🎉 Кассир подтвердил выдачу!\n<b>${String(pr.prize_title || "")}</b>` +
+                (coins > 0 ? `\n🪙 Начислено <b>${coins}</b> монет.` : ""),
+              {},
+              { appPublicId, tgUserId: String(pr.tg_id) }
+            );
+          } catch (_) {}
+
+          await tgAnswerCallbackQuery(botToken, cqId, "Подтверждено ✅", false);
+          return new Response("OK", { status: 200 });
+        }
+
+        await tgAnswerCallbackQuery(botToken, cqId, "Неизвестный тип приза", true);
+        return new Response("OK", { status: 200 });
+      }
+
+      if (data.startsWith("redeem_decline:")) {
+        const redeemCode = data.slice("redeem_decline:".length).trim();
+        await tgSendMessage(
+          env,
+          botToken,
+          String(chatId),
+          `⛔️ Выдача отменена.\nКод: <code>${redeemCode}</code>`,
+          {},
+          { appPublicId, tgUserId: from.id }
+        );
+        await tgAnswerCallbackQuery(botToken, cqId, "Отменено", false);
+        return new Response("OK", { status: 200 });
+      }
+
+      // 1) CANCEL CASHBACK (legacy/manual rollback)
       if (data.startsWith("sale_cancel:")) {
         const saleId = data.slice("sale_cancel:".length).trim();
         const act = await loadSaleAction(saleId);
@@ -519,13 +805,13 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           await awardCoins(
             env.DB,
             appId,
-            appPublicId,
+            String(act.appPublicId || appPublicId),
             String(act.customerTgId),
             -Math.abs(Number(act.cashbackCoins)),
             "sale_cancel",
             String(act.saleId || saleId),
             "cancel cashback",
-            `sale_cancel:${appPublicId}:${String(act.saleId || saleId)}`
+            `sale_cancel:${String(act.appPublicId || appPublicId)}:${String(act.saleId || saleId)}`
           );
         }
 
@@ -535,7 +821,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           String(chatId),
           `↩️ Кэшбэк отменён. Sale #${String(act.saleId || saleId)}.`,
           {},
-          { appPublicId, tgUserId: cashierTgId }
+          { appPublicId: String(act.appPublicId || appPublicId), tgUserId: cashierTgId }
         );
 
         try {
@@ -545,7 +831,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             String(act.customerTgId),
             `↩️ Кэшбэк по покупке отменён кассиром.`,
             {},
-            { appPublicId, tgUserId: String(act.customerTgId) }
+            { appPublicId: String(act.appPublicId || appPublicId), tgUserId: String(act.customerTgId) }
           );
         } catch (_) {}
 
@@ -569,7 +855,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
            WHERE app_public_id = ?
            ORDER BY id ASC`
         )
-          .bind(appPublicId)
+          .bind(String(act.appPublicId || appPublicId))
           .all();
 
         const items = rows && (rows as any).results ? (rows as any).results : [];
@@ -580,7 +866,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             String(chatId),
             `Нет карточек в styles_dict — нечего выдавать.`,
             {},
-            { appPublicId, tgUserId: cashierTgId }
+            { appPublicId: String(act.appPublicId || appPublicId), tgUserId: cashierTgId }
           );
           await tgAnswerCallbackQuery(botToken, cqId, "Нет стилей", true);
           return new Response("OK", { status: 200 });
@@ -602,7 +888,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           String(chatId),
           `Выбери штамп/день — PIN уйдёт клиенту (клиент: ${String(act.customerTgId)})`,
           { reply_markup: { inline_keyboard: kb } },
-          { appPublicId, tgUserId: cashierTgId }
+          { appPublicId: String(act.appPublicId || appPublicId), tgUserId: cashierTgId }
         );
 
         await tgAnswerCallbackQuery(botToken, cqId, "Выбери стиль", false);
@@ -626,15 +912,17 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           return new Response("OK", { status: 200 });
         }
 
+        const actAppPublicId = String(act.appPublicId || appPublicId);
+
         let stTitle = "";
         try {
           const r = await env.DB.prepare(`SELECT title FROM styles_dict WHERE app_public_id=? AND style_id=? LIMIT 1`)
-            .bind(appPublicId, styleId)
+            .bind(actAppPublicId, styleId)
             .first();
           stTitle = r ? String((r as any).title || "") : "";
         } catch (_) {}
 
-        const pinRes = await issuePinToCustomer(env.DB, appPublicId, cashierTgId, String(act.customerTgId), styleId);
+        const pinRes = await issuePinToCustomer(env.DB, actAppPublicId, cashierTgId, String(act.customerTgId), styleId);
         if (!pinRes || !pinRes.ok) {
           await tgAnswerCallbackQuery(botToken, cqId, "Не удалось создать PIN (см. логи).", true);
           return new Response("OK", { status: 200 });
@@ -647,12 +935,12 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             String(act.customerTgId),
             `🔑 Ваш PIN для отметки штампа${stTitle ? ` “${stTitle}”` : ""}:\n<code>${String(pinRes.pin)}</code>\n\n(одноразовый)`,
             {},
-            { appPublicId, tgUserId: String(act.customerTgId) }
+            { appPublicId: actAppPublicId, tgUserId: String(act.customerTgId) }
           );
         } catch (e) {
           logEvt("error", "pin.send_to_customer_failed", {
             err: errObj(e),
-            appPublicId,
+            appPublicId: actAppPublicId,
             customerTgId: String(act.customerTgId)
           });
         }
@@ -663,7 +951,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           String(chatId),
           `✅ PIN отправлен клиенту ${String(act.customerTgId)} для ${stTitle ? `“${stTitle}”` : styleId}.`,
           {},
-          { appPublicId, tgUserId: cashierTgId }
+          { appPublicId: actAppPublicId, tgUserId: cashierTgId }
         );
 
         await tgAnswerCallbackQuery(botToken, cqId, "PIN отправлен ✅", false);
@@ -721,8 +1009,8 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
         }
 
         // 1) wheel_redeems
-        const r = await env.DB.prepare(
-          `SELECT id, tg_id, prize_title, status
+        const r: any = await env.DB.prepare(
+          `SELECT id, tg_id, prize_code, prize_title, status
            FROM wheel_redeems
            WHERE app_public_id = ? AND redeem_code = ?
            LIMIT 1`
@@ -732,7 +1020,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
 
         // 2) passport_rewards fallback
         if (!r) {
-          const pr = await env.DB.prepare(
+          const pr: any = await env.DB.prepare(
             `SELECT id, tg_id, prize_code, prize_title, coins, passport_key, status
              FROM passport_rewards
              WHERE app_public_id = ? AND redeem_code = ?
@@ -747,123 +1035,78 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             return new Response("OK", { status: 200 });
           }
 
-          if (String((pr as any).status) === "redeemed") {
+          if (String(pr.status) === "redeemed") {
             await tgSendMessage(env, botToken, chatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
             return new Response("OK", { status: 200 });
           }
 
-          const updRes = await env.DB.prepare(
-            `UPDATE passport_rewards
-             SET status='redeemed',
-                 redeemed_at=datetime('now'),
-                 redeemed_by_tg=?
-             WHERE id=? AND status='issued'`
-          )
-            .bind(String(from.id), Number((pr as any).id))
-            .run();
+          const coins = Math.max(0, Math.floor(Number(pr.coins || 0)));
 
-          if (!updRes || !(updRes as any).meta || !(updRes as any).meta.changes) {
-            await tgSendMessage(env, botToken, chatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
-            return new Response("OK", { status: 200 });
-          }
-
-          const coins = Math.max(0, Math.floor(Number((pr as any).coins || 0)));
-
-          if (coins > 0) {
-            try {
-              await awardCoins(
-                env.DB,
-                appId,
-                appPublicId,
-                String((pr as any).tg_id),
-                coins,
-                "passport_complete_redeemed",
-                String((pr as any).prize_code || ""),
-                String((pr as any).prize_title || "Паспорт: приз"),
-                `passport:redeem:${appPublicId}:${String((pr as any).tg_id)}:${String((pr as any).id)}:${coins}`
-              );
-            } catch (e) {
-              logEvt("error", "passport.redeem_awardCoins_failed", { err: errObj(e), appPublicId, redeemCode });
-            }
-          }
-
+          // store confirm context + ask
           try {
-            await env.DB.prepare(`DELETE FROM styles_user WHERE app_public_id=? AND tg_id=?`)
-              .bind(appPublicId, String((pr as any).tg_id))
-              .run();
-          } catch (e) {
-            logEvt("error", "passport.reset_styles_user_failed", { err: errObj(e), appPublicId });
-          }
+            const rk = `redeem_action:${appPublicId}:${redeemCode}:${String(from.id)}`;
+            const payloadAct = { kind: "passport", redeemCode };
+            if (env.BOT_SECRETS) await env.BOT_SECRETS.put(rk, JSON.stringify(payloadAct), { expirationTtl: 3600 });
+          } catch (_) {}
 
           await tgSendMessage(
             env,
             botToken,
             chatId,
-            `✅ Приз по паспорту выдан.\nКод: <code>${redeemCode}</code>\nПриз: <b>${String((pr as any).prize_title || "")}</b>` +
-              (coins > 0 ? `\n🪙 Монеты: <b>${coins}</b> (начислены)` : ""),
-            {},
+            `❓ Подтвердить выдачу приза по паспорту?\nКод: <code>${redeemCode}</code>\nПриз: <b>${String(pr.prize_title || "")}</b>` +
+              (coins > 0 ? `\n🪙 Монеты: <b>${coins}</b>` : ""),
+            {
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: "✅ Да, выдать", callback_data: `redeem_confirm:${redeemCode}` },
+                  { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` }
+                ]]
+              }
+            },
             { appPublicId, tgUserId: from.id }
           );
-
-          try {
-            await tgSendMessage(
-              env,
-              botToken,
-              String((pr as any).tg_id),
-              `🎉 Ваш приз по паспорту получен!\n<b>${String((pr as any).prize_title || "")}</b>\n` +
-                (coins > 0 ? `🪙 Начислено <b>${coins}</b> монет.\n` : "") +
-                `Кассир подтвердил выдачу ✅`,
-              {},
-              { appPublicId, tgUserId: String((pr as any).tg_id) }
-            );
-          } catch (_) {}
 
           return new Response("OK", { status: 200 });
         }
 
-        // wheel redeem
-        if (String((r as any).status) === "redeemed") {
+        // wheel redeem -> ASK confirm (no instant update)
+        if (String(r.status) === "redeemed") {
           await tgSendMessage(env, botToken, chatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
           return new Response("OK", { status: 200 });
         }
 
-        await env.DB.prepare(
-          `UPDATE wheel_redeems
-           SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
-           WHERE id=?`
-        )
-          .bind(String(from.id), Number((r as any).id))
-          .run();
-
+        // show coins (if any) to cashier
+        let coins = 0;
         try {
-          await env.DB.prepare(
-            `UPDATE wheel_spins
-             SET status='redeemed', ts_redeemed=datetime('now'), redeemed_by_tg=?
-             WHERE app_public_id=? AND redeem_id=?`
-          )
-            .bind(String(from.id), appPublicId, Number((r as any).id))
-            .run();
+          const pr: any = await env.DB.prepare(
+            `SELECT coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`
+          ).bind(appPublicId, String(r.prize_code || "")).first();
+          coins = Math.max(0, Math.floor(Number(pr?.coins || 0)));
+        } catch (_) {}
+
+        // store confirm context + ask
+        try {
+          const rk = `redeem_action:${appPublicId}:${redeemCode}:${String(from.id)}`;
+          const payloadAct = { kind: "wheel", redeemCode };
+          if (env.BOT_SECRETS) await env.BOT_SECRETS.put(rk, JSON.stringify(payloadAct), { expirationTtl: 3600 });
         } catch (_) {}
 
         await tgSendMessage(
           env,
           botToken,
           chatId,
-          `✅ Приз выдан.\nКод: <code>${redeemCode}</code>\nПриз: <b>${String((r as any).prize_title || "")}</b>`,
-          {},
+          `❓ Подтвердить выдачу приза?\nКод: <code>${redeemCode}</code>\nПриз: <b>${String(r.prize_title || "")}</b>` +
+            (coins > 0 ? `\n🪙 Монеты: <b>${coins}</b>` : ""),
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "✅ Да, выдать", callback_data: `redeem_confirm:${redeemCode}` },
+                { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` }
+              ]]
+            }
+          },
           { appPublicId, tgUserId: from.id }
         );
-
-        try {
-          await tgSendMessage(
-            env,
-            botToken,
-            String((r as any).tg_id),
-            `🎉 Ваш приз получен!\n<b>${String((r as any).prize_title || "")}</b>\nКассир подтвердил выдачу ✅`,
-            {},
-            { appPublicId, tgUserId: String((r as any).tg_id) }
-          );
-        } catch (_) {}
 
         return new Response("OK", { status: 200 });
       }
@@ -956,46 +1199,25 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
 
         const saleId = (ins as any)?.meta?.last_row_id ? Number((ins as any).meta.last_row_id) : null;
 
-        if (pend.customerTgId && cashbackCoins > 0) {
-          await awardCoins(
-            env.DB,
-            appId,
-            pend.appPublicId || appPublicId,
-            String(pend.customerTgId),
-            cashbackCoins,
-            "sale_cashback",
-            String(saleId || ""),
-            `Кэшбэк ${cbp}% за покупку`,
-            `sale:${pend.appPublicId || appPublicId}:${pend.token || ""}`
-          );
-
-          await tgSendMessage(
-            env,
-            botToken,
-            String(pend.customerTgId),
-            `🎉 Начислено ${cashbackCoins} монет за покупку!\nСпасибо ❤️`,
-            {},
-            { appPublicId: pend.appPublicId || appPublicId, tgUserId: String(pend.customerTgId) }
-          );
-        }
-
+        // NOTE: больше НЕ начисляем кэшбэк сразу — только после подтверждения кассиром
         await tgSendMessage(
           env,
           botToken,
           chatId,
-          `✅ Продажа записана.\nСумма: ${(cents / 100).toFixed(2)}\nКэшбэк: ${cashbackCoins} монет`,
+          `✅ Продажа записана.\nСумма: ${(cents / 100).toFixed(2)}\nКэшбэк к выдаче: ${cashbackCoins} монет`,
           {},
           { appPublicId: pend.appPublicId || appPublicId, tgUserId: from.id }
         );
 
-        // post actions buttons
+        // post actions buttons (+ confirm)
         try {
           const actionKey = `sale_action:${pend.appPublicId || appPublicId}:${String(saleId || "")}:${String(from.id)}`;
           const actionPayload = {
             appPublicId: String(pend.appPublicId || appPublicId),
             saleId: String(saleId || ""),
             customerTgId: String(pend.customerTgId || ""),
-            cashbackCoins: Number(cashbackCoins || 0)
+            cashbackCoins: Number(cashbackCoins || 0),
+            cashback_percent: Number(cbp || 0)
           };
 
           if (env.BOT_SECRETS && saleId && pend.customerTgId) {
@@ -1006,12 +1228,15 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             env,
             botToken,
             chatId,
-            `Что сделать дальше?`,
+            `Подтвердить выдачу кэшбэка?`,
             {
               reply_markup: {
                 inline_keyboard: [
                   [
-                    { text: "↩️ Отменить кэшбэк", callback_data: `sale_cancel:${String(saleId || "")}` },
+                    { text: "✅ Подтвердить кэшбэк", callback_data: `sale_confirm:${String(saleId || "")}` },
+                    { text: "⛔️ Не выдавать", callback_data: `sale_decline:${String(saleId || "")}` }
+                  ],
+                  [
                     { text: "🔑 Выдать PIN", callback_data: `pin_menu:${String(saleId || "")}` }
                   ]
                 ]
