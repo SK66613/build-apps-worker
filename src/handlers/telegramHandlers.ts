@@ -9,8 +9,7 @@ import { tgAnswerPreCheckoutQuery } from "../services/telegramApi";
 import { tgSendMessage } from "../services/telegramSend";
 
 async function getSalesSettings(db: any, appPublicId: string){
-  try{
-    const row: any = await db.prepare(
+  const row: any = await db.prepare(
     `SELECT cashier1_tg_id, cashier2_tg_id, cashier3_tg_id, cashier4_tg_id, cashier5_tg_id,
             cashback_percent, ttl_sec
      FROM sales_settings
@@ -21,16 +20,11 @@ async function getSalesSettings(db: any, appPublicId: string){
     .map((x: any) => (x ? String(x).trim() : ''))
     .filter(Boolean);
 
-    return {
-      cashiers,
-      cashback_percent: row ? Number(row.cashback_percent || 10) : 10,
-      ttl_sec: row ? Number(row.ttl_sec || 300) : 300
-    };
-  }catch(e){
-    // if table missing or any DB error — fail-open with defaults
-    console.warn('[tg] getSalesSettings failed', String((e as any)?.message || e));
-    return { cashiers: [], cashback_percent: 10, ttl_sec: 300 };
-  }
+  return {
+    cashiers,
+    cashback_percent: row ? Number(row.cashback_percent || 10) : 10,
+    ttl_sec: row ? Number(row.ttl_sec || 300) : 300
+  };
 }
 
 function parseAmountToCents(s: any){
@@ -54,7 +48,6 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
     return new Response('FORBIDDEN', { status: 403 });
   }
 
-  try {
   // 2) parse update (always return 200 to Telegram)
   let upd;
   try {
@@ -875,10 +868,4 @@ async function bumpBotOutCounters(db, {
   ).run();
 }
 
-
-  } catch (e: any) {
-    // Telegram expects 200 OK; never fail webhook with 5xx
-    console.error('TG_WEBHOOK_ERROR', { publicId, msg: String(e?.message || e), stack: e?.stack || null });
-    return new Response('OK', { status: 200 });
-  }
 
