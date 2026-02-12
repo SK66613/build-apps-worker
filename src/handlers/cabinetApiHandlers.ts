@@ -199,11 +199,28 @@ export async function publishApp(appId: any, env: Env, _url: URL, request: Reque
   } catch (_e) {
     return json({ ok: false, error: "CONFIG_PARSE_ERROR" }, 500, request);
   }
+  
 
   if (!appObj.publicId) {
     const suffix = Math.random().toString(36).slice(2, 6);
     appObj.publicId = `app-${appId}-${suffix}`;
   }
+
+  const publicId = String(appObj.publicId);
+const draftKey = "app:draft:" + appId;
+const liveKey  = "app:live:" + publicId;
+
+// 1) берём blueprint для публикации: draft → иначе fallback на старое appObj.config
+let bpRaw = await env.APPS.get(draftKey);
+if (!bpRaw) {
+  bpRaw = JSON.stringify(appObj.config || null);
+}
+let bp: any = null;
+try { bp = JSON.parse(bpRaw); } catch (_) { bp = null; }
+
+// 2) записываем LIVE конфиг (то, что увидят пользователи)
+await env.APPS.put(liveKey, JSON.stringify(bp));
+
 
   appObj.public_id = appObj.publicId;
   appObj.lastPublishedAt = new Date().toISOString();
@@ -227,7 +244,8 @@ export async function publishApp(appId: any, env: Env, _url: URL, request: Reque
 
   // sales settings sync on publish
   try {
-    const salesCfg = extractSalesSettingsFromBlueprint(appObj.config || null);
+    const salesCfg = extractSalesSettingsFromBlueprint(bp || null);
+
     await upsertSalesSettings(appId, String(appObj.publicId || ""), salesCfg, env);
   } catch (e) {
     console.error("[sales_settings] sync on publish failed", e);
@@ -243,7 +261,8 @@ export async function publishApp(appId: any, env: Env, _url: URL, request: Reque
       (runtimeCfg.passport && Array.isArray(runtimeCfg.passport.styles) && runtimeCfg.passport.styles.length === 0));
 
   if (looksEmpty) {
-    runtimeCfg = extractRuntimeConfigFromBlueprint(appObj.config || null);
+    runtimeCfg = extractRuntimeConfigFromBlueprint(bp || null);
+
     appObj.app_config = runtimeCfg;
     try {
       await env.APPS.put("app:" + appId, JSON.stringify(appObj));
