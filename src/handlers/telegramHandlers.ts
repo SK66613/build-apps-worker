@@ -26,12 +26,11 @@ function errObj(e: any) {
     name: String(e?.name || "Error"),
     message: String(e?.message || e),
     stack: e?.stack ? String(e.stack) : null,
-    cause: e?.cause ? String(e.cause) : null
+    cause: e?.cause ? String(e.cause) : null,
   };
 }
 
 function logEvt(level: "info" | "warn" | "error", tag: string, data: any) {
-  // One-line JSON logs are easiest to read/filter in CF logs
   const payload = { level, tag, ...data };
   const line = safeJson(payload, 16000);
   if (level === "error") console.error(line);
@@ -78,7 +77,7 @@ async function getSalesSettings(db: any, appPublicId: string) {
       row?.cashier2_tg_id,
       row?.cashier3_tg_id,
       row?.cashier4_tg_id,
-      row?.cashier5_tg_id
+      row?.cashier5_tg_id,
     ]
       .map((x: any) => (x ? String(x).trim() : ""))
       .filter(Boolean);
@@ -86,20 +85,16 @@ async function getSalesSettings(db: any, appPublicId: string) {
     return {
       cashiers,
       cashback_percent: row ? Number(row.cashback_percent || 10) : 10,
-      ttl_sec: row ? Number(row.ttl_sec || 300) : 300
+      ttl_sec: row ? Number(row.ttl_sec || 300) : 300,
     };
   } catch (e) {
-    // fail-open with defaults
     logEvt("warn", "tg.getSalesSettings_failed", { err: errObj(e), appPublicId });
     return { cashiers: [], cashback_percent: 10, ttl_sec: 300 };
   }
 }
 
 function parseAmountToCents(s: any) {
-  // принимает: "123", "123.45", "123,45"
-  const raw = String(s || "")
-    .trim()
-    .replace(",", ".");
+  const raw = String(s || "").trim().replace(",", ".");
   if (!raw) return null;
   if (!/^\d+(\.\d{1,2})?$/.test(raw)) return null;
   const parts = raw.split(".");
@@ -112,6 +107,23 @@ function parseAmountToCents(s: any) {
 // must match token creator (where you generate sale token)
 function saleTokKey(token: string) {
   return `sale_tok:${String(token || "").trim()}`;
+}
+
+// KV keys
+function salePendKey(appPublicId: string, cashierTgId: string) {
+  return `sale_pending:${String(appPublicId)}:${String(cashierTgId)}`;
+}
+function saleDraftKey(appPublicId: string, cashierTgId: string) {
+  return `sale_draft:${String(appPublicId)}:${String(cashierTgId)}`;
+}
+function saleActionKey(appPublicId: string, saleId: string, cashierTgId: string) {
+  return `sale_action:${String(appPublicId)}:${String(saleId)}:${String(cashierTgId)}`;
+}
+function redeemActionKey(appPublicId: string, redeemCode: string, cashierTgId: string) {
+  return `redeem_action:${String(appPublicId)}:${String(redeemCode)}:${String(cashierTgId)}`;
+}
+function pinActionKey(appPublicId: string, pin: string, cashierTgId: string) {
+  return `pin_action:${String(appPublicId)}:${String(pin)}:${String(cashierTgId)}`;
 }
 
 // ================== PINs (MONOLITH COMPAT) ==================
@@ -137,19 +149,12 @@ async function issuePinToCustomer(
           `INSERT INTO pins_pool (app_public_id, pin, target_tg_id, style_id, issued_by_tg, issued_at)
            VALUES (?, ?, ?, ?, ?, datetime('now'))`
         )
-        .bind(
-          String(appPublicId),
-          String(pin),
-          String(customerTgId),
-          String(styleId),
-          String(cashierTgId)
-        )
+        .bind(String(appPublicId), String(pin), String(customerTgId), String(styleId), String(cashierTgId))
         .run();
 
       return { ok: true, pin };
     } catch (e: any) {
       const msg = String(e?.message || e);
-      // коллизия UNIQUE(app_public_id,pin) — пробуем ещё
       if (/unique|constraint/i.test(msg)) continue;
 
       logEvt("error", "pin.issue_failed", {
@@ -157,12 +162,39 @@ async function issuePinToCustomer(
         appPublicId,
         cashierTgId,
         customerTgId,
-        styleId
+        styleId,
       });
       return { ok: false, error: "PIN_DB_ERROR" };
     }
   }
   return { ok: false, error: "PIN_CREATE_FAILED" };
+}
+
+// Отмена PIN = пометить used_at (чтобы он больше не работал)
+async function voidPin(db: any, appPublicId: string, pin: string) {
+  const row: any = await db
+    .prepare(
+      `SELECT id, used_at
+       FROM pins_pool
+       WHERE app_public_id=? AND pin=?
+       LIMIT 1`
+    )
+    .bind(String(appPublicId), String(pin))
+    .first();
+
+  if (!row) return { ok: false, error: "PIN_NOT_FOUND" };
+  if (row.used_at) return { ok: true, already: true };
+
+  await db
+    .prepare(
+      `UPDATE pins_pool
+       SET used_at = datetime('now')
+       WHERE id=? AND used_at IS NULL`
+    )
+    .bind(Number(row.id))
+    .run();
+
+  return { ok: true, voided: true };
 }
 
 // ================== TELEGRAM API HELPERS (LOCAL) ==================
@@ -173,12 +205,12 @@ async function tgAnswerCallbackQuery(botToken: string, callbackQueryId: string, 
     const body = {
       callback_query_id: callbackQueryId,
       text: text || "",
-      show_alert: !!showAlert
+      show_alert: !!showAlert,
     };
     await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
     });
   } catch (e) {
     logEvt("warn", "tg.answerCallbackQuery_failed", { err: errObj(e) });
@@ -192,12 +224,12 @@ async function logBotMessage(
   {
     appPublicId,
     tgUserId,
-    direction, // 'in'|'out'
-    msgType, // 'text'|'command'|'callback'|'system'
+    direction,
+    msgType,
     text = null,
     chatId = null,
     tgMessageId = null,
-    payload = null
+    payload = null,
   }: any
 ) {
   try {
@@ -223,12 +255,8 @@ async function logBotMessage(
   }
 }
 
-async function upsertAppUserFromBot(
-  db: any,
-  { appId, appPublicId, tgUserId, tgUsername = null }: any
-) {
+async function upsertAppUserFromBot(db: any, { appId, appPublicId, tgUserId, tgUsername = null }: any) {
   try {
-    // Requires UNIQUE(app_public_id, tg_user_id)
     await db
       .prepare(
         `INSERT INTO app_users (
@@ -250,17 +278,16 @@ async function upsertAppUserFromBot(
   }
 }
 
-// Minimal state for /profile (no heavy deps)
+// Minimal state for /profile
 async function buildStateLite(db: any, appId: any, appPublicId: string, tgId: string, cfg: any = {}) {
   const out: any = {
     coins: 0,
     styles_count: 0,
     styles_total: 0,
     game_today_best: 0,
-    ref_total: 0
+    ref_total: 0,
   };
 
-  // coins
   try {
     const u = await db
       .prepare(`SELECT coins FROM app_users WHERE app_public_id = ? AND tg_user_id = ? LIMIT 1`)
@@ -271,7 +298,6 @@ async function buildStateLite(db: any, appId: any, appPublicId: string, tgId: st
     logEvt("warn", "state.coins_failed", { err: errObj(e), appPublicId, tgId });
   }
 
-  // styles collected count
   try {
     const r = await db
       .prepare(
@@ -286,18 +312,13 @@ async function buildStateLite(db: any, appId: any, appPublicId: string, tgId: st
     logEvt("warn", "state.styles_count_failed", { err: errObj(e), appPublicId, tgId });
   }
 
-  // styles total
   try {
-    const r = await db
-      .prepare(`SELECT COUNT(*) AS c FROM styles_dict WHERE app_public_id = ?`)
-      .bind(String(appPublicId))
-      .first();
+    const r = await db.prepare(`SELECT COUNT(*) AS c FROM styles_dict WHERE app_public_id = ?`).bind(String(appPublicId)).first();
     out.styles_total = r ? Number((r as any).c || 0) : 0;
   } catch (e) {
     logEvt("warn", "state.styles_total_failed", { err: errObj(e), appPublicId });
   }
 
-  // game today best
   try {
     const today = new Date().toISOString().slice(0, 10);
     const g = await db
@@ -314,14 +335,9 @@ async function buildStateLite(db: any, appId: any, appPublicId: string, tgId: st
     logEvt("warn", "state.game_failed", { err: errObj(e), appPublicId, tgId });
   }
 
-  // referrals total (optional table; fail-open)
   try {
     const r = await db
-      .prepare(
-        `SELECT COUNT(*) AS c
-         FROM referrals
-         WHERE app_public_id = ? AND referrer_tg_id = ?`
-      )
+      .prepare(`SELECT COUNT(*) AS c FROM referrals WHERE app_public_id = ? AND referrer_tg_id = ?`)
       .bind(String(appPublicId), String(tgId))
       .first();
     out.ref_total = r ? Number((r as any).c || 0) : 0;
@@ -344,14 +360,12 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
   let fromId: any = null;
   let chatId: any = null;
 
-  // Always return 200 to Telegram (even if errors)
   try {
     const expected = await getBotWebhookSecretForPublicId(publicId, env);
     if (!expected || !timingSafeEqual(s, expected)) {
       return new Response("FORBIDDEN", { status: 403 });
     }
 
-    // parse update
     try {
       upd = await request.json();
       updateId = upd && upd.update_id != null ? String(upd.update_id) : "";
@@ -359,12 +373,9 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
       return new Response("OK", { status: 200 });
     }
 
-    // quick context for logs
     const updType = pickUpdateType(upd);
     const msg =
-      upd.message ||
-      upd.edited_message ||
-      (upd.callback_query ? upd.callback_query.message : null);
+      upd.message || upd.edited_message || (upd.callback_query ? upd.callback_query.message : null);
 
     const from =
       (upd.message && upd.message.from) ||
@@ -375,18 +386,16 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
     fromId = from ? from.id : null;
     chatId = msg && msg.chat ? msg.chat.id : (from ? from.id : null);
 
-    // log incoming base (info)
     logEvt("info", "tg.webhook_in", {
       publicId,
       updateId,
       updType,
       fromId,
       chatId,
-      cfRay: (request.headers.get("cf-ray") || null),
-      len: request.headers.get("content-length") || null
+      cfRay: request.headers.get("cf-ray") || null,
+      len: request.headers.get("content-length") || null,
     });
 
-    // dedupe update_id (KV TTL)
     if (env.BOT_SECRETS && updateId) {
       const k = `tg_upd:public:${publicId}:${updateId}`;
       const seen = await env.BOT_SECRETS.get(k);
@@ -394,11 +403,10 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
       await env.BOT_SECRETS.put(k, "1", { expirationTtl: 3600 });
     }
 
-    // ===== STARS: answer pre_checkout_query + successful_payment ASAP =====
+    // ===== STARS =====
     try {
       const botTokenEarly = await getBotTokenForApp(publicId, env, null);
       if (botTokenEarly) {
-        // A) pre_checkout_query
         if (upd && upd.pre_checkout_query) {
           const pcq = upd.pre_checkout_query;
           const invPayload = String(pcq.invoice_payload || "");
@@ -416,24 +424,16 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
                FROM stars_orders
                WHERE id = ? AND app_public_id = ?
                LIMIT 1`
-            )
-              .bind(orderId, publicId)
-              .first();
+            ).bind(orderId, publicId).first();
 
-            if (!row) {
-              ok = false;
-              err = "Order not found";
-            } else if (String((row as any).status) !== "created") {
-              ok = false;
-              err = "Order already processed";
-            }
+            if (!row) { ok = false; err = "Order not found"; }
+            else if (String((row as any).status) !== "created") { ok = false; err = "Order already processed"; }
           }
 
           await tgAnswerPreCheckoutQuery(botTokenEarly, pcq.id, ok, err);
           return new Response("OK", { status: 200 });
         }
 
-        // B) successful_payment
         const sp = upd?.message?.successful_payment;
         if (sp) {
           const invPayload = String(sp.invoice_payload || "");
@@ -448,15 +448,13 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
                    provider_payment_charge_id = ?,
                    paid_total_amount = ?
                WHERE id = ? AND app_public_id = ?`
-            )
-              .bind(
-                String(sp.telegram_payment_charge_id || ""),
-                String(sp.provider_payment_charge_id || ""),
-                Number(sp.total_amount || 0),
-                orderId,
-                publicId
-              )
-              .run();
+            ).bind(
+              String(sp.telegram_payment_charge_id || ""),
+              String(sp.provider_payment_charge_id || ""),
+              Number(sp.total_amount || 0),
+              orderId,
+              publicId
+            ).run();
           }
 
           return new Response("OK", { status: 200 });
@@ -466,53 +464,129 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
       logEvt("error", "stars.handler_failed", { publicId, updateId, err: errObj(e) });
     }
 
-    // need from/chat to proceed further
     if (!chatId || !from) return new Response("OK", { status: 200 });
 
-    // bot token
     const botToken = await getBotTokenForApp(publicId, env, null);
     if (!botToken) return new Response("OK", { status: 200 });
 
-    // ctx
     const ctx = await resolveAppContextByPublicId(publicId, env);
     if (!ctx || !ctx.ok) return new Response("OK", { status: 200 });
 
     const appPublicId = ctx.publicId || publicId;
     const appId = ctx.appId;
 
-    // === CALLBACK QUERIES ===
-    if (upd && upd.callback_query && upd.callback_query.data) {
+    // ================= CALLBACKS =================
+    if (upd?.callback_query?.data) {
       const cq = upd.callback_query;
       const data = String(cq.data || "");
       const cqId = String(cq.id || "");
       const cashierTgId = String(from.id);
 
-      async function loadSaleAction(saleId: string) {
-        const k = `sale_action:${appPublicId}:${String(saleId || "")}:${cashierTgId}`;
+      const loadKV = async (k: string) => {
         const raw = env.BOT_SECRETS ? await env.BOT_SECRETS.get(k) : null;
         if (!raw) return null;
-        try {
-          return JSON.parse(raw);
-        } catch (_) {
-          return null;
+        try { return JSON.parse(raw); } catch (_) { return null; }
+      };
+
+      // ---------- SALE: confirm record ----------
+      if (data === "sale_reenter") {
+        // вернуть кассира на ввод суммы
+        const pend = await loadKV(salePendKey(appPublicId, cashierTgId));
+        if (!pend || !pend.customerTgId) {
+          await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
+          return new Response("OK", { status: 200 });
         }
+        await tgSendMessage(env, botToken, String(chatId), "Введите сумму заново:", {}, { appPublicId, tgUserId: cashierTgId });
+        await tgAnswerCallbackQuery(botToken, cqId, "Ок", false);
+        return new Response("OK", { status: 200 });
       }
 
-      async function loadRedeemAction(key: string) {
-        const k = `redeem_action:${appPublicId}:${String(key || "")}:${cashierTgId}`;
-        const raw = env.BOT_SECRETS ? await env.BOT_SECRETS.get(k) : null;
-        if (!raw) return null;
-        try {
-          return JSON.parse(raw);
-        } catch (_) {
-          return null;
+      if (data === "sale_drop") {
+        // отменить вообще
+        if (env.BOT_SECRETS) {
+          await env.BOT_SECRETS.delete(saleDraftKey(appPublicId, cashierTgId)).catch(()=>{});
+          await env.BOT_SECRETS.delete(salePendKey(appPublicId, cashierTgId)).catch(()=>{});
         }
+        await tgSendMessage(env, botToken, String(chatId), "⛔️ Продажа отменена.", {}, { appPublicId, tgUserId: cashierTgId });
+        await tgAnswerCallbackQuery(botToken, cqId, "Отменено", false);
+        return new Response("OK", { status: 200 });
       }
 
-      // 0) SALE CONFIRM (new)
+      if (data === "sale_record") {
+        // записать sale в БД из draft
+        const draft = await loadKV(saleDraftKey(appPublicId, cashierTgId));
+        if (!draft || !draft.customerTgId) {
+          await tgAnswerCallbackQuery(botToken, cqId, "Черновик продажи не найден (истёк).", true);
+          return new Response("OK", { status: 200 });
+        }
+
+        // запись sale
+        const ins = await env.DB.prepare(
+          `INSERT INTO sales (app_id, app_public_id, customer_tg_id, cashier_tg_id, amount_cents, cashback_coins, token, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+        ).bind(
+          String(appId || ""),
+          String(draft.appPublicId || appPublicId),
+          String(draft.customerTgId || ""),
+          String(cashierTgId),
+          Number(draft.amount_cents || 0),
+          Number(draft.cashbackCoins || 0),
+          String(draft.token || "")
+        ).run();
+
+        const saleId = (ins as any)?.meta?.last_row_id ? String((ins as any).meta.last_row_id) : "";
+
+        // удалить draft, оставить pend (чтобы pin_menu работал от sale_action)
+        if (env.BOT_SECRETS) {
+          await env.BOT_SECRETS.delete(saleDraftKey(appPublicId, cashierTgId)).catch(()=>{});
+          await env.BOT_SECRETS.delete(salePendKey(appPublicId, cashierTgId)).catch(()=>{});
+        }
+
+        // сохранить action контекст на 1 час
+        const actionPayload = {
+          appPublicId: String(draft.appPublicId || appPublicId),
+          saleId,
+          customerTgId: String(draft.customerTgId || ""),
+          cashbackCoins: Number(draft.cashbackCoins || 0),
+          cashback_percent: Number(draft.cashback_percent || 0),
+          amount_cents: Number(draft.amount_cents || 0),
+        };
+        if (env.BOT_SECRETS && saleId) {
+          await env.BOT_SECRETS.put(saleActionKey(actionPayload.appPublicId, saleId, cashierTgId), JSON.stringify(actionPayload), { expirationTtl: 3600 });
+        }
+
+        await tgSendMessage(
+          env,
+          botToken,
+          String(chatId),
+          `✅ Продажа записана.\nСумма: ${(Number(actionPayload.amount_cents)/100).toFixed(2)}\nКэшбэк к выдаче: ${Number(actionPayload.cashbackCoins)} монет\nSale #${saleId}`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "✅ Подтвердить кэшбэк", callback_data: `sale_confirm:${saleId}` },
+                  { text: "⛔️ Не выдавать", callback_data: `sale_decline:${saleId}` },
+                ],
+                [
+                  { text: "🔑 Выдать PIN", callback_data: `pin_menu:${saleId}` },
+                ],
+                [
+                  { text: "↩️ Отменить кэшбэк", callback_data: `sale_cancel:${saleId}` },
+                ],
+              ],
+            },
+          },
+          { appPublicId: actionPayload.appPublicId, tgUserId: cashierTgId }
+        );
+
+        await tgAnswerCallbackQuery(botToken, cqId, "Записано ✅", false);
+        return new Response("OK", { status: 200 });
+      }
+
+      // ---------- SALE CONFIRM CASHBACK ----------
       if (data.startsWith("sale_confirm:")) {
         const saleId = data.slice("sale_confirm:".length).trim();
-        const act = await loadSaleAction(saleId);
+        const act = await loadKV(saleActionKey(appPublicId, saleId, cashierTgId));
 
         if (!act || !act.customerTgId) {
           await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
@@ -563,7 +637,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
 
       if (data.startsWith("sale_decline:")) {
         const saleId = data.slice("sale_decline:".length).trim();
-        const act = await loadSaleAction(saleId);
+        const act = await loadKV(saleActionKey(appPublicId, saleId, cashierTgId));
 
         if (!act || !act.customerTgId) {
           await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
@@ -592,14 +666,14 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           );
         } catch (_) {}
 
-        await tgAnswerCallbackQuery(botToken, cqId, "Отменено", false);
+        await tgAnswerCallbackQuery(botToken, cqId, "Ок", false);
         return new Response("OK", { status: 200 });
       }
 
-      // 0b) REDEEM CONFIRM/DECLINE (new)
+      // ---------- REDEEM CONFIRM/DECLINE ----------
       if (data.startsWith("redeem_confirm:")) {
         const redeemCode = data.slice("redeem_confirm:".length).trim();
-        const act = await loadRedeemAction(redeemCode);
+        const act = await loadKV(redeemActionKey(appPublicId, redeemCode, cashierTgId));
 
         if (!act || !act.redeemCode) {
           await tgAnswerCallbackQuery(botToken, cqId, "Контекст приза не найден (истёк).", true);
@@ -616,11 +690,11 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           ).bind(appPublicId, redeemCode).first();
 
           if (!r) {
-            await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: from.id });
+            await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: cashierTgId });
             return new Response("OK", { status: 200 });
           }
           if (String(r.status) === "redeemed") {
-            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
+            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: cashierTgId });
             return new Response("OK", { status: 200 });
           }
 
@@ -651,14 +725,14 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             `UPDATE wheel_redeems
              SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
              WHERE id=? AND status='issued'`
-          ).bind(String(from.id), Number(r.id)).run();
+          ).bind(String(cashierTgId), Number(r.id)).run();
 
           try {
             await env.DB.prepare(
               `UPDATE wheel_spins
                SET status='redeemed', ts_redeemed=datetime('now'), redeemed_by_tg=?
                WHERE app_public_id=? AND redeem_id=?`
-            ).bind(String(from.id), appPublicId, Number(r.id)).run();
+            ).bind(String(cashierTgId), appPublicId, Number(r.id)).run();
           } catch (_) {}
 
           await tgSendMessage(
@@ -668,7 +742,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             `✅ Выдача подтверждена.\nКод: <code>${redeemCode}</code>\nПриз: <b>${String(r.prize_title || "")}</b>` +
               (coins > 0 ? `\n🪙 Начислено: <b>${coins}</b>` : ""),
             {},
-            { appPublicId, tgUserId: from.id }
+            { appPublicId, tgUserId: cashierTgId }
           );
 
           try {
@@ -698,12 +772,12 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           ).bind(appPublicId, redeemCode).first();
 
           if (!pr) {
-            await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: from.id });
+            await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: cashierTgId });
             return new Response("OK", { status: 200 });
           }
 
           if (String(pr.status) === "redeemed") {
-            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
+            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: cashierTgId });
             return new Response("OK", { status: 200 });
           }
 
@@ -713,37 +787,42 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
                  redeemed_at=datetime('now'),
                  redeemed_by_tg=?
              WHERE id=? AND status='issued'`
-          ).bind(String(from.id), Number(pr.id)).run();
+          ).bind(String(cashierTgId), Number(pr.id)).run();
 
           if (!updRes || !(updRes as any).meta || !(updRes as any).meta.changes) {
-            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
+            await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: cashierTgId });
             return new Response("OK", { status: 200 });
           }
 
           const coins = Math.max(0, Math.floor(Number(pr.coins || 0)));
           if (coins > 0) {
-            try {
-              await awardCoins(
-                env.DB,
-                appId,
-                appPublicId,
-                String(pr.tg_id),
-                coins,
-                "passport_complete_redeemed",
-                String(pr.prize_code || ""),
-                String(pr.prize_title || "Паспорт: приз"),
-                `passport:redeem:${appPublicId}:${String(pr.tg_id)}:${String(pr.id)}:${coins}`
-              );
-            } catch (e) {
-              logEvt("error", "passport.redeem_awardCoins_failed", { err: errObj(e), appPublicId, redeemCode });
-            }
+            await awardCoins(
+              env.DB,
+              appId,
+              appPublicId,
+              String(pr.tg_id),
+              coins,
+              "passport_complete_redeemed",
+              String(pr.prize_code || ""),
+              String(pr.prize_title || "Паспорт: приз"),
+              `passport:redeem:${appPublicId}:${String(pr.tg_id)}:${String(pr.id)}:${coins}`
+            );
           }
 
-          // reset passport
+          // Сброс круга паспорта (статистика rewards остаётся!)
           try {
             await env.DB.prepare(`DELETE FROM styles_user WHERE app_public_id=? AND tg_id=?`)
               .bind(appPublicId, String(pr.tg_id))
               .run();
+          } catch (_) {}
+
+          // отметить в passport_bonus тоже (если есть строка)
+          try {
+            await env.DB.prepare(
+              `UPDATE passport_bonus
+               SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
+               WHERE app_public_id=? AND redeem_code=? AND status='issued'`
+            ).bind(String(cashierTgId), appPublicId, redeemCode).run();
           } catch (_) {}
 
           await tgSendMessage(
@@ -753,7 +832,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             `✅ Выдача подтверждена.\nКод: <code>${redeemCode}</code>\nПриз: <b>${String(pr.prize_title || "")}</b>` +
               (coins > 0 ? `\n🪙 Начислено: <b>${coins}</b>` : ""),
             {},
-            { appPublicId, tgUserId: from.id }
+            { appPublicId, tgUserId: cashierTgId }
           );
 
           try {
@@ -784,23 +863,22 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           String(chatId),
           `⛔️ Выдача отменена.\nКод: <code>${redeemCode}</code>`,
           {},
-          { appPublicId, tgUserId: from.id }
+          { appPublicId, tgUserId: cashierTgId }
         );
         await tgAnswerCallbackQuery(botToken, cqId, "Отменено", false);
         return new Response("OK", { status: 200 });
       }
 
-      // 1) CANCEL CASHBACK (legacy/manual rollback)
+      // ---------- CANCEL CASHBACK (rollback) ----------
       if (data.startsWith("sale_cancel:")) {
         const saleId = data.slice("sale_cancel:".length).trim();
-        const act = await loadSaleAction(saleId);
+        const act = await loadKV(saleActionKey(appPublicId, saleId, cashierTgId));
 
         if (!act || !act.customerTgId) {
           await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
           return new Response("OK", { status: 200 });
         }
 
-        // rollback coins (idempotent by event_id)
         if (Number(act.cashbackCoins) > 0) {
           await awardCoins(
             env.DB,
@@ -839,10 +917,10 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
         return new Response("OK", { status: 200 });
       }
 
-      // 2) PIN MENU
+      // ---------- PIN MENU ----------
       if (data.startsWith("pin_menu:")) {
         const saleId = data.slice("pin_menu:".length).trim();
-        const act = await loadSaleAction(saleId);
+        const act = await loadKV(saleActionKey(appPublicId, saleId, cashierTgId));
 
         if (!act || !act.customerTgId) {
           await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
@@ -854,9 +932,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
            FROM styles_dict
            WHERE app_public_id = ?
            ORDER BY id ASC`
-        )
-          .bind(String(act.appPublicId || appPublicId))
-          .all();
+        ).bind(String(act.appPublicId || appPublicId)).all();
 
         const items = rows && (rows as any).results ? (rows as any).results : [];
         if (!items.length) {
@@ -895,14 +971,14 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
         return new Response("OK", { status: 200 });
       }
 
-      // 3) PIN MAKE
+      // ---------- PIN MAKE ----------
       if (data.startsWith("pin_make:")) {
         const rest = data.slice("pin_make:".length);
         const [saleIdRaw, styleIdRaw] = rest.split(":");
         const saleId = String(saleIdRaw || "").trim();
         const styleId = String(styleIdRaw || "").trim();
 
-        const act = await loadSaleAction(saleId);
+        const act = await loadKV(saleActionKey(appPublicId, saleId, cashierTgId));
         if (!act || !act.customerTgId) {
           await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
           return new Response("OK", { status: 200 });
@@ -916,9 +992,9 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
 
         let stTitle = "";
         try {
-          const r = await env.DB.prepare(`SELECT title FROM styles_dict WHERE app_public_id=? AND style_id=? LIMIT 1`)
-            .bind(actAppPublicId, styleId)
-            .first();
+          const r = await env.DB.prepare(
+            `SELECT title FROM styles_dict WHERE app_public_id=? AND style_id=? LIMIT 1`
+          ).bind(actAppPublicId, styleId).first();
           stTitle = r ? String((r as any).title || "") : "";
         } catch (_) {}
 
@@ -927,6 +1003,17 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           await tgAnswerCallbackQuery(botToken, cqId, "Не удалось создать PIN (см. логи).", true);
           return new Response("OK", { status: 200 });
         }
+
+        // сохранить контекст PIN (для отмены)
+        try {
+          if (env.BOT_SECRETS) {
+            await env.BOT_SECRETS.put(
+              pinActionKey(actAppPublicId, String(pinRes.pin), cashierTgId),
+              JSON.stringify({ appPublicId: actAppPublicId, pin: String(pinRes.pin), customerTgId: String(act.customerTgId), styleId }),
+              { expirationTtl: 3600 }
+            );
+          }
+        } catch (_) {}
 
         try {
           await tgSendMessage(
@@ -941,16 +1028,23 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           logEvt("error", "pin.send_to_customer_failed", {
             err: errObj(e),
             appPublicId: actAppPublicId,
-            customerTgId: String(act.customerTgId)
+            customerTgId: String(act.customerTgId),
           });
         }
 
+        // кассиру: подтверждение + кнопка отмены PIN
         await tgSendMessage(
           env,
           botToken,
           String(chatId),
-          `✅ PIN отправлен клиенту ${String(act.customerTgId)} для ${stTitle ? `“${stTitle}”` : styleId}.`,
-          {},
+          `✅ PIN отправлен клиенту ${String(act.customerTgId)} для ${stTitle ? `“${stTitle}”` : styleId}.\nPIN: <code>${String(pinRes.pin)}</code>`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "⛔️ Отменить PIN", callback_data: `pin_void:${String(pinRes.pin)}` }],
+              ],
+            },
+          },
           { appPublicId: actAppPublicId, tgUserId: cashierTgId }
         );
 
@@ -958,16 +1052,42 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
         return new Response("OK", { status: 200 });
       }
 
+      // ---------- PIN VOID ----------
+      if (data.startsWith("pin_void:")) {
+        const pin = data.slice("pin_void:".length).trim();
+        const act = await loadKV(pinActionKey(appPublicId, pin, cashierTgId));
+        const actAppPublicId = String(act?.appPublicId || appPublicId);
+
+        const res = await voidPin(env.DB, actAppPublicId, pin);
+
+        if (!res.ok) {
+          await tgAnswerCallbackQuery(botToken, cqId, "PIN не найден", true);
+          return new Response("OK", { status: 200 });
+        }
+
+        await tgSendMessage(
+          env,
+          botToken,
+          String(chatId),
+          `⛔️ PIN отменён.\nPIN: <code>${pin}</code>`,
+          {},
+          { appPublicId: actAppPublicId, tgUserId: cashierTgId }
+        );
+
+        await tgAnswerCallbackQuery(botToken, cqId, "Отменено", false);
+        return new Response("OK", { status: 200 });
+      }
+
       await tgAnswerCallbackQuery(botToken, cqId, "Неизвестное действие", false);
       return new Response("OK", { status: 200 });
     }
 
-    // sync + log incoming
+    // ================= SYNC + LOG IN =================
     await upsertAppUserFromBot(env.DB, {
       appId,
       appPublicId,
       tgUserId: from.id,
-      tgUsername: from.username || null
+      tgUsername: from.username || null,
     });
 
     await logBotMessage(env.DB, {
@@ -982,7 +1102,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
         null,
       chatId,
       tgMessageId: msg && msg.message_id ? msg.message_id : null,
-      payload: { update: upd }
+      payload: { update: upd },
     });
 
     const text =
@@ -990,14 +1110,13 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
       (upd.edited_message && upd.edited_message.text) ||
       (upd.callback_query && upd.callback_query.data) ||
       "";
-
     const t = String(text || "").trim();
 
-    // ===== /start =====
+    // ================= /start =================
     if (t === "/start" || t.startsWith("/start ")) {
       const payload = t.startsWith("/start ") ? t.slice(7).trim() : "";
 
-      // ===== REDEEM FLOW: /start redeem_<code> =====
+      // ----- redeem flow -----
       if (payload.startsWith("redeem_")) {
         const redeemCode = payload.slice(7).trim();
 
@@ -1008,17 +1127,13 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           return new Response("OK", { status: 200 });
         }
 
-        // 1) wheel_redeems
         const r: any = await env.DB.prepare(
           `SELECT id, tg_id, prize_code, prize_title, status
            FROM wheel_redeems
            WHERE app_public_id = ? AND redeem_code = ?
            LIMIT 1`
-        )
-          .bind(appPublicId, redeemCode)
-          .first();
+        ).bind(appPublicId, redeemCode).first();
 
-        // 2) passport_rewards fallback
         if (!r) {
           const pr: any = await env.DB.prepare(
             `SELECT id, tg_id, prize_code, prize_title, coins, passport_key, status
@@ -1026,15 +1141,12 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
              WHERE app_public_id = ? AND redeem_code = ?
              ORDER BY id DESC
              LIMIT 1`
-          )
-            .bind(appPublicId, redeemCode)
-            .first();
+          ).bind(appPublicId, redeemCode).first();
 
           if (!pr) {
             await tgSendMessage(env, botToken, chatId, "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: from.id });
             return new Response("OK", { status: 200 });
           }
-
           if (String(pr.status) === "redeemed") {
             await tgSendMessage(env, botToken, chatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
             return new Response("OK", { status: 200 });
@@ -1042,11 +1154,14 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
 
           const coins = Math.max(0, Math.floor(Number(pr.coins || 0)));
 
-          // store confirm context + ask
           try {
-            const rk = `redeem_action:${appPublicId}:${redeemCode}:${String(from.id)}`;
-            const payloadAct = { kind: "passport", redeemCode };
-            if (env.BOT_SECRETS) await env.BOT_SECRETS.put(rk, JSON.stringify(payloadAct), { expirationTtl: 3600 });
+            if (env.BOT_SECRETS) {
+              await env.BOT_SECRETS.put(
+                redeemActionKey(appPublicId, redeemCode, String(from.id)),
+                JSON.stringify({ kind: "passport", redeemCode }),
+                { expirationTtl: 3600 }
+              );
+            }
           } catch (_) {}
 
           await tgSendMessage(
@@ -1059,9 +1174,9 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
               reply_markup: {
                 inline_keyboard: [[
                   { text: "✅ Да, выдать", callback_data: `redeem_confirm:${redeemCode}` },
-                  { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` }
-                ]]
-              }
+                  { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` },
+                ]],
+              },
             },
             { appPublicId, tgUserId: from.id }
           );
@@ -1069,26 +1184,28 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           return new Response("OK", { status: 200 });
         }
 
-        // wheel redeem -> ASK confirm (no instant update)
+        // wheel redeem -> ask confirm
         if (String(r.status) === "redeemed") {
           await tgSendMessage(env, botToken, chatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from.id });
           return new Response("OK", { status: 200 });
         }
 
-        // show coins (if any) to cashier
         let coins = 0;
         try {
-          const pr: any = await env.DB.prepare(
+          const pr2: any = await env.DB.prepare(
             `SELECT coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`
           ).bind(appPublicId, String(r.prize_code || "")).first();
-          coins = Math.max(0, Math.floor(Number(pr?.coins || 0)));
+          coins = Math.max(0, Math.floor(Number(pr2?.coins || 0)));
         } catch (_) {}
 
-        // store confirm context + ask
         try {
-          const rk = `redeem_action:${appPublicId}:${redeemCode}:${String(from.id)}`;
-          const payloadAct = { kind: "wheel", redeemCode };
-          if (env.BOT_SECRETS) await env.BOT_SECRETS.put(rk, JSON.stringify(payloadAct), { expirationTtl: 3600 });
+          if (env.BOT_SECRETS) {
+            await env.BOT_SECRETS.put(
+              redeemActionKey(appPublicId, redeemCode, String(from.id)),
+              JSON.stringify({ kind: "wheel", redeemCode }),
+              { expirationTtl: 3600 }
+            );
+          }
         } catch (_) {}
 
         await tgSendMessage(
@@ -1101,9 +1218,9 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
             reply_markup: {
               inline_keyboard: [[
                 { text: "✅ Да, выдать", callback_data: `redeem_confirm:${redeemCode}` },
-                { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` }
-              ]]
-            }
+                { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` },
+              ]],
+            },
           },
           { appPublicId, tgUserId: from.id }
         );
@@ -1111,7 +1228,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
         return new Response("OK", { status: 200 });
       }
 
-      // ===== SALE FLOW: /start sale_<token> =====
+      // ----- sale flow -----
       if (payload.startsWith("sale_")) {
         const token = payload.slice(5).trim();
 
@@ -1129,22 +1246,20 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
 
         const ss = await getSalesSettings(env.DB, tokenAppPublicId);
         const isCashier = ss.cashiers.includes(String(from.id));
-
         if (!isCashier) {
           await tgSendMessage(env, botToken, chatId, "⛔️ Вы не зарегистрированы как кассир для этого проекта.", {}, { appPublicId, tgUserId: from.id });
           return new Response("OK", { status: 200 });
         }
 
-        const pendKey = `sale_pending:${tokenAppPublicId}:${from.id}`;
         const pend = {
           appPublicId: tokenAppPublicId,
           customerTgId,
           token,
-          cashback_percent: ss.cashback_percent
+          cashback_percent: ss.cashback_percent,
         };
 
         if (env.BOT_SECRETS) {
-          await env.BOT_SECRETS.put(pendKey, JSON.stringify(pend), { expirationTtl: 600 });
+          await env.BOT_SECRETS.put(salePendKey(tokenAppPublicId, String(from.id)), JSON.stringify(pend), { expirationTtl: 600 });
           try { await env.BOT_SECRETS.delete(saleTokKey(token)); } catch (_) {}
         }
 
@@ -1164,10 +1279,10 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
       return new Response("OK", { status: 200 });
     }
 
-    // ===== AMOUNT STEP after sale_pending =====
+    // ================= AMOUNT STEP: draft + ask confirm =================
     try {
-      const pendKey = `sale_pending:${appPublicId}:${from.id}`;
-      const pendRaw = env.BOT_SECRETS ? await env.BOT_SECRETS.get(pendKey) : null;
+      // сначала ищем pend по appPublicId текущего вебхука
+      const pendRaw = env.BOT_SECRETS ? await env.BOT_SECRETS.get(salePendKey(appPublicId, String(from.id))) : null;
 
       if (pendRaw) {
         let pend: any = null;
@@ -1182,80 +1297,47 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
         const cbp = Math.max(0, Math.min(100, Number(pend?.cashback_percent ?? 10)));
         const cashbackCoins = Math.max(0, Math.floor((cents / 100) * (cbp / 100)));
 
-        const ins = await env.DB.prepare(
-          `INSERT INTO sales (app_id, app_public_id, customer_tg_id, cashier_tg_id, amount_cents, cashback_coins, token, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`
-        )
-          .bind(
-            String(appId || ""),
-            String(pend.appPublicId || appPublicId),
-            String(pend.customerTgId || ""),
-            String(from.id),
-            Number(cents),
-            Number(cashbackCoins),
-            String(pend.token || "")
-          )
-          .run();
+        const draft = {
+          appPublicId: String(pend.appPublicId || appPublicId),
+          customerTgId: String(pend.customerTgId || ""),
+          token: String(pend.token || ""),
+          amount_cents: Number(cents),
+          cashbackCoins: Number(cashbackCoins),
+          cashback_percent: Number(cbp),
+        };
 
-        const saleId = (ins as any)?.meta?.last_row_id ? Number((ins as any).meta.last_row_id) : null;
+        if (env.BOT_SECRETS) {
+          await env.BOT_SECRETS.put(saleDraftKey(String(pend.appPublicId || appPublicId), String(from.id)), JSON.stringify(draft), { expirationTtl: 600 });
+        }
 
-        // NOTE: больше НЕ начисляем кэшбэк сразу — только после подтверждения кассиром
         await tgSendMessage(
           env,
           botToken,
           chatId,
-          `✅ Продажа записана.\nСумма: ${(cents / 100).toFixed(2)}\nКэшбэк к выдаче: ${cashbackCoins} монет`,
-          {},
-          { appPublicId: pend.appPublicId || appPublicId, tgUserId: from.id }
+          `❓ Записать продажу?\nСумма: <b>${(cents/100).toFixed(2)}</b>\nКэшбэк к выдаче: <b>${cashbackCoins}</b> монет\nКлиент: <code>${String(pend.customerTgId || "")}</code>`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "✅ Да, записать", callback_data: "sale_record" },
+                  { text: "✏️ Ввести заново", callback_data: "sale_reenter" },
+                ],
+                [
+                  { text: "⛔️ Отменить", callback_data: "sale_drop" },
+                ],
+              ],
+            },
+          },
+          { appPublicId: String(pend.appPublicId || appPublicId), tgUserId: from.id }
         );
 
-        // post actions buttons (+ confirm)
-        try {
-          const actionKey = `sale_action:${pend.appPublicId || appPublicId}:${String(saleId || "")}:${String(from.id)}`;
-          const actionPayload = {
-            appPublicId: String(pend.appPublicId || appPublicId),
-            saleId: String(saleId || ""),
-            customerTgId: String(pend.customerTgId || ""),
-            cashbackCoins: Number(cashbackCoins || 0),
-            cashback_percent: Number(cbp || 0)
-          };
-
-          if (env.BOT_SECRETS && saleId && pend.customerTgId) {
-            await env.BOT_SECRETS.put(actionKey, JSON.stringify(actionPayload), { expirationTtl: 3600 });
-          }
-
-          await tgSendMessage(
-            env,
-            botToken,
-            chatId,
-            `Подтвердить выдачу кэшбэка?`,
-            {
-              reply_markup: {
-                inline_keyboard: [
-                  [
-                    { text: "✅ Подтвердить кэшбэк", callback_data: `sale_confirm:${String(saleId || "")}` },
-                    { text: "⛔️ Не выдавать", callback_data: `sale_decline:${String(saleId || "")}` }
-                  ],
-                  [
-                    { text: "🔑 Выдать PIN", callback_data: `pin_menu:${String(saleId || "")}` }
-                  ]
-                ]
-              }
-            },
-            { appPublicId: pend.appPublicId || appPublicId, tgUserId: from.id }
-          );
-        } catch (e) {
-          logEvt("error", "sale.post_actions_failed", { err: errObj(e), appPublicId });
-        }
-
-        if (env.BOT_SECRETS) await env.BOT_SECRETS.delete(pendKey);
         return new Response("OK", { status: 200 });
       }
     } catch (e) {
       logEvt("error", "sale.amount_step_failed", { err: errObj(e), appPublicId, fromId });
     }
 
-    // ===== /profile =====
+    // ================= /profile =================
     if (t === "/profile") {
       try {
         const appObj = await env.APPS.get("app:" + ctx.appId, "json").catch(() => null);
@@ -1267,7 +1349,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
           `🪙 Монеты: ${Number(state.coins || 0)}`,
           `🎨 Стили: ${Number(state.styles_count || 0)}/${Number(state.styles_total || 0)}`,
           `🎮 Лучший сегодня: ${Number(state.game_today_best || 0)}`,
-          `🎟 Рефералы: ${Number(state.ref_total || 0)}`
+          `🎟 Рефералы: ${Number(state.ref_total || 0)}`,
         ];
 
         await tgSendMessage(env, botToken, chatId, lines.join("\n"), {}, { appPublicId, tgUserId: from.id });
@@ -1283,7 +1365,6 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
     await tgSendMessage(env, botToken, chatId, "Принял ✅\nКоманда: /profile", {}, { appPublicId, tgUserId: from.id });
     return new Response("OK", { status: 200 });
   } catch (e: any) {
-    // HARD FAIL SAFE: never return 5xx to Telegram
     logEvt("error", "tg.webhook_fatal", {
       publicId,
       updateId,
@@ -1291,7 +1372,7 @@ export async function handleTelegramWebhook(publicId: string, request: Request, 
       chatId,
       err: errObj(e),
       updType: pickUpdateType(upd),
-      upd: upd ? safeJson(upd, 8000) : null
+      upd: upd ? safeJson(upd, 8000) : null,
     });
     return new Response("OK", { status: 200 });
   }
