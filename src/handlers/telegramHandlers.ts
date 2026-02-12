@@ -779,7 +779,6 @@ try{
   // default
   await tgSendMessage(env, botToken, chatId, 'Принял ✅\nКоманда: /profile', {}, { appPublicId, tgUserId: from.id });
   return new Response('OK', { status: 200 });
-}
 
 
 
