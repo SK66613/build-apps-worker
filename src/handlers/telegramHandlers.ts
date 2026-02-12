@@ -114,10 +114,7 @@ function saleTokKey(token: string) {
   return `sale_tok:${String(token || "").trim()}`;
 }
 
-// same as legacy: 4 digits pin
-function randomPin4() {
-  return String(Math.floor(1000 + Math.random() * 9000));
-}
+
 
 /**
  * Creates/updates pin in pins_pool, binds it to customer + style.
