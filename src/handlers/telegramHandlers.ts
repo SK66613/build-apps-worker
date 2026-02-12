@@ -109,55 +109,6 @@ function parseAmountToCents(s: any) {
   return rub * 100 + kop;
 }
 
-// ================== PINs (moved from monolith/_legacyImpl) ==================
-
-function randomPin4() {
-  // 1000..9999 (не 0000)
-  return String(Math.floor(1000 + Math.random() * 9000));
-}
-
-/**
- * Creates a one-time PIN for конкретного клиента (tg) и конкретного style_id.
- * Uses table pins_pool with UNIQUE(app_public_id, pin) expected.
- */
-async function issuePinToCustomer(
-  db: any,
-  appPublicId: string,
-  cashierTgId: string,
-  customerTgId: string,
-  styleId: string
-) {
-  let pin = "";
-  for (let i = 0; i < 12; i++) {
-    pin = randomPin4();
-    try {
-      await db
-        .prepare(
-          `INSERT INTO pins_pool (app_public_id, pin, target_tg_id, style_id, issued_by_tg, issued_at)
-           VALUES (?, ?, ?, ?, ?, datetime('now'))`
-        )
-        .bind(
-          String(appPublicId),
-          String(pin),
-          String(customerTgId),
-          String(styleId),
-          String(cashierTgId)
-        )
-        .run();
-
-      return { ok: true, pin };
-    } catch (e: any) {
-      const msg = String(e?.message || e);
-      // collision UNIQUE(app_public_id,pin) — try again
-      if (/unique|constraint/i.test(msg)) continue;
-      console.error("[pin] issuePinToCustomer DB error", msg);
-      return { ok: false, error: "PIN_DB_ERROR" };
-    }
-  }
-  return { ok: false, error: "PIN_CREATE_FAILED" };
-}
-
-
 // must match token creator (where you generate sale token)
 function saleTokKey(token: string) {
   return `sale_tok:${String(token || "").trim()}`;
