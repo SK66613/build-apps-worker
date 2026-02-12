@@ -39,24 +39,34 @@ export async function routeCabinet(request: Request, env: Env, url: URL): Promis
     if (!ownerCheck.ok) return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status || 403, request);
 
     const key = "app:" + appId;
+const draftKey = "app:draft:" + appId;
 
-    if (request.method === "GET") {
-      const appObj = (await env.APPS.get(key, "json")) || {};
-      return json({ ok: true, config: (appObj as any).config ?? null }, 200, request);
-    }
+if (request.method === "GET") {
+  // 1) сначала пробуем draft
+  const draft = await env.APPS.get(draftKey, "json");
+  if (draft) return json({ ok: true, config: draft }, 200, request);
 
-    if (request.method === "PUT") {
-      const body: any = await request.json().catch(() => ({}));
-      const bp = body?.config || body?.blueprint || body?.bp || null;
-      const appObj = (await env.APPS.get(key, "json")) || {};
-      (appObj as any).config = bp;
-      (appObj as any).updatedAt = new Date().toISOString();
-      await env.APPS.put(key, JSON.stringify(appObj));
-      return json({ ok: true }, 200, request);
-    }
+  // 2) fallback на старый формат (чтобы старые проекты не сломались)
+  const appObj = (await env.APPS.get(key, "json")) || {};
+  return json({ ok: true, config: (appObj as any).config ?? null }, 200, request);
+}
 
-    return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
-  }
+
+if (request.method === "PUT") {
+  const body: any = await request.json().catch(() => ({}));
+  const bp = body?.config || body?.blueprint || body?.bp || null;
+
+  // пишем ТОЛЬКО draft
+  await env.APPS.put(draftKey, JSON.stringify(bp));
+
+  // (опционально) обновим updatedAt у app meta, но НЕ трогаем appObj.config
+  const appObj = (await env.APPS.get(key, "json")) || {};
+  (appObj as any).updatedAt = new Date().toISOString();
+  await env.APPS.put(key, JSON.stringify(appObj));
+
+  return json({ ok: true }, 200, request);
+}
+
 
 
   // ===== apps list =====
