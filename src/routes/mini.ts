@@ -993,55 +993,9 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
       .bind((ctx as any).publicId, String(lastWon.prize_code || ""))
       .first();
 
-    const prizeCoins = Math.max(0, Math.floor(Number(pr?.coins || 0)));
+        const prizeCoins = Math.max(0, Math.floor(Number(pr?.coins || 0)));
 
-    // A) монетный приз -> начислить сразу
-    if (prizeCoins > 0) {
-      await awardCoins(
-        db,
-        (ctx as any).appId,
-        (ctx as any).publicId,
-        tg.id,
-        prizeCoins,
-        "wheel_prize_claim",
-        String(lastWon.prize_code || ""),
-        String(lastWon.prize_title || ""),
-        `wheel:claim:${(ctx as any).publicId}:${tg.id}:${spinId}:${lastWon.prize_code || ""}:${prizeCoins}`
-      );
-
-      await db
-        .prepare(`UPDATE wheel_spins SET status='claimed', ts_claim=datetime('now') WHERE id=? AND status='won'`)
-        .bind(spinId)
-        .run();
-
-      // сообщение в бота (как в монолите)
-      try {
-        const botToken = await getBotTokenForApp((ctx as any).publicId, env);
-        if (botToken) {
-          const txt =
-            `✅ Начислено <b>${prizeCoins} 🪙</b>\n` +
-            `🎁 Приз: <b>${String(lastWon.prize_title || "Бонус")}</b>`;
-          await tgSendMessage(env, botToken, String(tg.id), txt, {}, { appPublicId: (ctx as any).publicId, tgUserId: String(tg.id) });
-        }
-      } catch (e) {
-        console.error("[wheel.claim] tgSendMessage coins failed", e);
-      }
-
-      const fresh_state = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
-      return json(
-        {
-          ok: true,
-          claimed: true,
-          prize: { code: lastWon.prize_code || "", title: lastWon.prize_title || "", coins: prizeCoins },
-          spin_id: spinId,
-          fresh_state,
-        },
-        200,
-        request
-      );
-    }
-
-    // B) физ.приз -> wheel_redeems + deep link redeem_
+    // B) ЛЮБОЙ приз -> wheel_redeems + deep link redeem_ (монеты тоже через кассира)
     let redeem: any = await db
       .prepare(
         `SELECT id, redeem_code, status
@@ -1074,7 +1028,11 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
             )
             .run();
 
-          redeem = { id: Number((ins2 as any)?.meta?.last_row_id || (ins2 as any)?.lastInsertRowid || 0), redeem_code: code, status: "issued" };
+          redeem = {
+            id: Number((ins2 as any)?.meta?.last_row_id || (ins2 as any)?.lastInsertRowid || 0),
+            redeem_code: code,
+            status: "issued",
+          };
           break;
         } catch (e: any) {
           const msg = String(e?.message || e);
@@ -1103,13 +1061,14 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     const redeem_code = String(redeem.redeem_code || "");
     const deep_link = botUsername ? `https://t.me/${botUsername}?start=redeem_${encodeURIComponent(redeem_code)}` : "";
 
-    // сообщение в бота (код выдачи)
+    // сообщение пользователю: код выдачи (монеты тоже только после подтверждения кассиром)
     try {
       const botToken = await getBotTokenForApp((ctx as any).publicId, env);
       if (botToken) {
         const txt =
-          `🎁 Ваш приз: <b>${String(lastWon.prize_title || "Бонус")}</b>\n\n` +
-          `✅ Код выдачи: <code>${redeem_code}</code>\n` +
+          `🎁 Ваш приз: <b>${String(lastWon.prize_title || "Бонус")}</b>\n` +
+          (prizeCoins > 0 ? `🪙 Монеты: <b>${prizeCoins}</b> (начислятся после подтверждения кассиром)\n` : ``) +
+          `\n✅ Код выдачи: <code>${redeem_code}</code>\n` +
           (deep_link ? `Откройте ссылку:\n${deep_link}` : `Покажите код кассиру.`);
         await tgSendMessage(env, botToken, String(tg.id), txt, {}, { appPublicId: (ctx as any).publicId, tgUserId: String(tg.id) });
       }
@@ -1118,7 +1077,20 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     }
 
     const fresh_state = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
-    return json({ ok: true, issued: true, redeem_code, deep_link, spin_id: spinId, fresh_state }, 200, request);
+    return json(
+      {
+        ok: true,
+        issued: true,
+        redeem_code,
+        deep_link,
+        spin_id: spinId,
+        prize: { code: lastWon.prize_code || "", title: lastWon.prize_title || "", coins: prizeCoins },
+        fresh_state,
+      },
+      200,
+      request
+    );
+
   }
 
 
