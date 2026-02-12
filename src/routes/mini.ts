@@ -1246,3 +1246,4 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
 export async function routeMiniApi(request: Request, env: Env, url: URL): Promise<Response> {
   return await handleMiniApi(request, env, url);
 }
+
