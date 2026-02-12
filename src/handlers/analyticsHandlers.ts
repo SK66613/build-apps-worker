@@ -7,6 +7,20 @@ import { jsonResponse } from "../services/http";
 import { getCanonicalPublicIdForApp } from "../services/apps";
 import { parseRangeOrDefault as _parseRangeOrDefault, daysBetweenInclusive as _daysBetweenInclusive } from "../services/analyticsRange";
 
+// NOTE: legacy used a helper for YYYY-MM-DD + N days.
+// Keep it local to avoid circular deps and to make the handler self-contained.
+function addDaysIso(isoDate: string, days: number): string {
+  // isoDate: YYYY-MM-DD
+  const m = String(isoDate || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return "";
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const d = Number(m[3]);
+  const dt = new Date(Date.UTC(y, mo, d));
+  dt.setUTCDate(dt.getUTCDate() + Number(days || 0));
+  return dt.toISOString().slice(0, 10);
+}
+
 const json = (obj: any, status = 200, request: Request | null = null) => jsonResponse(obj, status, request as any);
 
 

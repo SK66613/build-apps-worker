@@ -247,25 +247,30 @@ export async function handlePublicEvent(publicId: string, request: Request, env:
 
     // upsert best score
     // game_scores schema: app_public_id, tg_id, game_id, mode, date, score, duration_ms, updated_at
-    const existing: any = await db.prepare(
-      `SELECT id, score FROM game_scores
-       WHERE app_public_id = ? AND tg_id = ? AND game_id = ? AND mode = ? AND date = ?
-       LIMIT 1`
-    ).bind(canonicalPublicId, String(tgId), gameId, mode, dateStr).first();
+    // IMPORTANT: if the table is missing in some tenants, do not crash the whole public event endpoint.
+    try {
+      const existing: any = await db.prepare(
+        `SELECT id, score FROM game_scores
+         WHERE app_public_id = ? AND tg_id = ? AND game_id = ? AND mode = ? AND date = ?
+         LIMIT 1`
+      ).bind(canonicalPublicId, String(tgId), gameId, mode, dateStr).first();
 
-    let bestScore = score;
-    if (existing) {
-      bestScore = Math.max(Number(existing.score || 0), score);
-      await db.prepare(
-        `UPDATE game_scores
-         SET score = ?, duration_ms = ?, updated_at = datetime('now')
-         WHERE id = ?`
-      ).bind(bestScore, dur, existing.id).run();
-    } else {
-      await db.prepare(
-        `INSERT INTO game_scores (app_id, app_public_id, tg_id, game_id, mode, date, score, duration_ms, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`
-      ).bind(appId, canonicalPublicId, String(tgId), gameId, mode, dateStr, bestScore, dur).run();
+      let bestScore = score;
+      if (existing) {
+        bestScore = Math.max(Number(existing.score || 0), score);
+        await db.prepare(
+          `UPDATE game_scores
+           SET score = ?, duration_ms = ?, updated_at = datetime('now')
+           WHERE id = ?`
+        ).bind(bestScore, dur, existing.id).run();
+      } else {
+        await db.prepare(
+          `INSERT INTO game_scores (app_id, app_public_id, tg_id, game_id, mode, date, score, duration_ms, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`
+        ).bind(appId, canonicalPublicId, String(tgId), gameId, mode, dateStr, bestScore, dur).run();
+      }
+    } catch (e) {
+      console.warn('[game_scores] upsert skipped (table missing?)', e);
     }
 
     // reward coins based on score (simple: 1 coin per 10 score)
