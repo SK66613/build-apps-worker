@@ -300,13 +300,14 @@ async function passportGetIssued(db: any, appPublicId: string, tgId: any, passpo
     .prepare(
       `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
        FROM passport_rewards
-       WHERE app_public_id = ? AND tg_id = ? AND passport_key = ?
+       WHERE app_public_id = ? AND tg_id = ? AND passport_key = ? AND status='issued'
        ORDER BY id DESC
        LIMIT 1`
     )
-    .bind(appPublicId, String(tgId), String(passportKey || "default"))
+    .bind(String(appPublicId), String(tgId), String(passportKey || "default"))
     .first();
 }
+
 
 function randomRedeemCode(len = 10) {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -327,21 +328,13 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
   const got = await passportCollectedCount(db, ctx.publicId, tgId);
   if (got < total) return { ok: true, skipped: true, reason: "NOT_COMPLETED", got, total };
 
-  const ex = await db
-    .prepare(
-      `SELECT id, prize_code, prize_title, coins, redeem_code, status
-       FROM passport_rewards
-       WHERE app_public_id=? AND tg_id=? AND passport_key=?
-       ORDER BY id DESC
-       LIMIT 1`
-    )
-    .bind(ctx.publicId, String(tgId), passportKey)
-    .first();
-
-  if (ex && String((ex as any).status) === "issued") {
-    return { ok: true, issued: true, reused: true, reward: ex, got, total };
+  // 1) если уже есть НЕзабранный (issued) — не плодим коды, возвращаем его
+  const issued = await passportGetIssued(db, ctx.publicId, tgId, passportKey);
+  if (issued) {
+    return { ok: true, issued: true, reused: true, reward: issued, got, total };
   }
 
+  // 2) приз берём из wheel_prizes (как у тебя было)
   const pr = await db
     .prepare(`SELECT code, title, coins FROM wheel_prizes WHERE app_public_id = ? AND code = ? LIMIT 1`)
     .bind(ctx.publicId, prizeCode)
@@ -354,36 +347,23 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
 
   const botToken = await getBotTokenForApp(ctx.publicId, env, ctx.appId).catch(() => null);
 
+  // 3) всегда INSERT новой строки в passport_rewards (НИКАКИХ UPDATE старых!)
   let redeemCode = "";
+  let rewardId: number | null = null;
+
   for (let i = 0; i < 8; i++) {
     redeemCode = randomRedeemCode(10);
     try {
-      if (ex && (ex as any).id) {
-        await db
-          .prepare(
-            `UPDATE passport_rewards
-             SET status='issued',
-                 issued_at=datetime('now'),
-                 redeemed_at=NULL,
-                 redeemed_by_tg=NULL,
-                 prize_code=?,
-                 prize_title=?,
-                 coins=?,
-                 redeem_code=?
-             WHERE id=?`
-          )
-          .bind(prizeCode, prizeTitle, prizeCoins, redeemCode, Number((ex as any).id))
-          .run();
-      } else {
-        await db
-          .prepare(
-            `INSERT INTO passport_rewards
-             (app_id, app_public_id, tg_id, passport_key, prize_code, prize_title, coins, redeem_code, status, issued_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
-          )
-          .bind(ctx.appId, ctx.publicId, String(tgId), passportKey, prizeCode, prizeTitle, prizeCoins, redeemCode)
-          .run();
-      }
+      const ins = await db
+        .prepare(
+          `INSERT INTO passport_rewards
+           (app_id, app_public_id, tg_id, passport_key, prize_code, prize_title, coins, redeem_code, status, issued_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
+        )
+        .bind(ctx.appId, ctx.publicId, String(tgId), passportKey, prizeCode, prizeTitle, prizeCoins, redeemCode)
+        .run();
+
+      rewardId = Number((ins as any)?.meta?.last_row_id || (ins as any)?.lastInsertRowid || 0) || null;
       break;
     } catch (e: any) {
       const msg = String(e?.message || e);
@@ -391,18 +371,35 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
       throw e;
     }
   }
+
   if (!redeemCode) return { ok: false, error: "PASSPORT_REDEEM_CREATE_FAILED" };
 
+  // 4) Пишем в passport_bonus для аналитики (новая таблица)
   try {
     await db
       .prepare(
-        `INSERT INTO bonus_claims (app_id, app_public_id, tg_id, prize_id, prize_name, prize_value, claim_status)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending')`
+        `INSERT INTO passport_bonus
+         (app_id, app_public_id, tg_id, passport_key, total_styles, collected_styles,
+          prize_code, prize_title, coins, redeem_code, status, issued_at, meta_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?)`
       )
-      .bind(ctx.appId, ctx.publicId, String(tgId), prizeCode, prizeTitle, prizeCoins)
+      .bind(
+        ctx.appId,
+        ctx.publicId,
+        String(tgId),
+        passportKey,
+        Number(total),
+        Number(got),
+        prizeCode,
+        prizeTitle,
+        Number(prizeCoins),
+        redeemCode,
+        safeJson({ reward_id: rewardId })
+      )
       .run();
   } catch (_) {}
 
+  // 5) сообщение пользователю с кодом
   let botUsername = "";
   try {
     const b = await db
@@ -439,6 +436,7 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
 
   return { ok: true, issued: true, reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode }, got, total };
 }
+
 
 // ================== WHEEL ==================
 async function pickWheelPrize(db: any, appPublicId: string) {
