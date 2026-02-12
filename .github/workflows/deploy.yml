@@ -4,44 +4,20 @@ on:
   push:
     branches: ["main"]
 
-concurrency:
-  group: build-apps-worker-main
-  cancel-in-progress: true
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: "npm"
+          cache: 'npm'
 
-      # Кеш именно того, что Wrangler/Miniflare качают тяжёлого
-      - name: Cache Wrangler/Workerd/Miniflare
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.wrangler
-            ~/.cache
-          key: ${{ runner.os }}-wrangler-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-wrangler-
+      # Быстро и предсказуемо (с package-lock.json)
+      - run: npm ci --prefer-offline --no-audit
 
-      - name: Install deps
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci --prefer-offline --no-audit --no-fund
-          else
-            npm install --prefer-offline --no-audit --no-fund
-          fi
-
-      - name: Deploy
-        run: npx wrangler deploy
+      - run: npm run deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CI: "true"
