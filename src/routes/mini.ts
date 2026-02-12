@@ -300,11 +300,11 @@ async function passportGetIssued(db: any, appPublicId: string, tgId: any, passpo
     .prepare(
       `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
        FROM passport_rewards
-       WHERE app_public_id = ? AND tg_id = ? AND passport_key = ? AND status='issued'
+       WHERE app_public_id=? AND tg_id=? AND passport_key=? AND status='issued'
        ORDER BY id DESC
        LIMIT 1`
     )
-    .bind(String(appPublicId), String(tgId), String(passportKey || "default"))
+    .bind(appPublicId, String(tgId), String(passportKey || "default"))
     .first();
 }
 
@@ -328,42 +328,49 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
   const got = await passportCollectedCount(db, ctx.publicId, tgId);
   if (got < total) return { ok: true, skipped: true, reason: "NOT_COMPLETED", got, total };
 
-  // 1) если уже есть НЕзабранный (issued) — не плодим коды, возвращаем его
-  const issued = await passportGetIssued(db, ctx.publicId, tgId, passportKey);
-  if (issued) {
-    return { ok: true, issued: true, reused: true, reward: issued, got, total };
+  // ✅ 1) если уже есть НЕВЫДАННЫЙ приз (issued) — не плодим новые строки
+  const existingIssued: any = await db.prepare(
+    `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
+     FROM passport_rewards
+     WHERE app_public_id=? AND tg_id=? AND passport_key=? AND status='issued'
+     ORDER BY id DESC
+     LIMIT 1`
+  ).bind(ctx.publicId, String(tgId), passportKey).first();
+
+  if (existingIssued) {
+    return { ok: true, issued: true, reused: true, reward: existingIssued, got, total };
   }
 
-  // 2) приз берём из wheel_prizes (как у тебя было)
-  const pr = await db
-    .prepare(`SELECT code, title, coins FROM wheel_prizes WHERE app_public_id = ? AND code = ? LIMIT 1`)
+  // ✅ 2) берём приз из wheel_prizes (как у тебя)
+  const pr: any = await db
+    .prepare(`SELECT code, title, coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`)
     .bind(ctx.publicId, prizeCode)
     .first();
 
   if (!pr) return { ok: false, error: "REWARD_PRIZE_NOT_FOUND", prize_code: prizeCode };
 
-  const prizeTitle = String((pr as any).title || prizeCode);
-  const prizeCoins = Math.max(0, Math.floor(Number((pr as any).coins || 0)));
+  const prizeTitle = String(pr.title || prizeCode);
+  const prizeCoins = Math.max(0, Math.floor(Number(pr.coins || 0)));
 
-  const botToken = await getBotTokenForApp(ctx.publicId, env, ctx.appId).catch(() => null);
-
-  // 3) всегда INSERT новой строки в passport_rewards (НИКАКИХ UPDATE старых!)
+  // ✅ 3) создаём НОВУЮ строку в passport_rewards (история)
   let redeemCode = "";
-  let rewardId: number | null = null;
-
   for (let i = 0; i < 8; i++) {
     redeemCode = randomRedeemCode(10);
     try {
-      const ins = await db
-        .prepare(
-          `INSERT INTO passport_rewards
-           (app_id, app_public_id, tg_id, passport_key, prize_code, prize_title, coins, redeem_code, status, issued_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
-        )
-        .bind(ctx.appId, ctx.publicId, String(tgId), passportKey, prizeCode, prizeTitle, prizeCoins, redeemCode)
-        .run();
-
-      rewardId = Number((ins as any)?.meta?.last_row_id || (ins as any)?.lastInsertRowid || 0) || null;
+      await db.prepare(
+        `INSERT INTO passport_rewards
+         (app_id, app_public_id, tg_id, passport_key, prize_code, prize_title, coins, redeem_code, status, issued_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
+      ).bind(
+        ctx.appId,
+        ctx.publicId,
+        String(tgId),
+        passportKey,
+        prizeCode,
+        prizeTitle,
+        prizeCoins,
+        redeemCode
+      ).run();
       break;
     } catch (e: any) {
       const msg = String(e?.message || e);
@@ -371,49 +378,19 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
       throw e;
     }
   }
-
   if (!redeemCode) return { ok: false, error: "PASSPORT_REDEEM_CREATE_FAILED" };
 
-  // 4) Пишем в passport_bonus для аналитики (новая таблица)
-  try {
-    await db
-      .prepare(
-        `INSERT INTO passport_bonus
-         (app_id, app_public_id, tg_id, passport_key, total_styles, collected_styles,
-          prize_code, prize_title, coins, redeem_code, status, issued_at, meta_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?)`
-      )
-      .bind(
-        ctx.appId,
-        ctx.publicId,
-        String(tgId),
-        passportKey,
-        Number(total),
-        Number(got),
-        prizeCode,
-        prizeTitle,
-        Number(prizeCoins),
-        redeemCode,
-        safeJson({ reward_id: rewardId })
-      )
-      .run();
-  } catch (_) {}
+  // Сообщение пользователю (как у тебя)
+  const botToken = await getBotTokenForApp(ctx.publicId, env, ctx.appId).catch(() => null);
 
-  // 5) сообщение пользователю с кодом
   let botUsername = "";
   try {
     const b = await db
-      .prepare(
-        `SELECT username FROM bots
-         WHERE app_public_id = ? AND status='active'
-         ORDER BY id DESC LIMIT 1`
-      )
+      .prepare(`SELECT username FROM bots WHERE app_public_id=? AND status='active' ORDER BY id DESC LIMIT 1`)
       .bind(ctx.publicId)
       .first();
     botUsername = b && (b as any).username ? String((b as any).username).replace(/^@/, "").trim() : "";
-  } catch (_) {
-    botUsername = "";
-  }
+  } catch (_) {}
 
   const deepLink = botUsername ? `https://t.me/${botUsername}?start=redeem_${encodeURIComponent(redeemCode)}` : "";
 
@@ -434,7 +411,13 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
     console.error("[passport.reward] tgSendMessage redeem failed", e);
   }
 
-  return { ok: true, issued: true, reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode }, got, total };
+  return {
+    ok: true,
+    issued: true,
+    reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode },
+    got,
+    total
+  };
 }
 
 
