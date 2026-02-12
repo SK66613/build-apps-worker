@@ -124,6 +124,11 @@ function randomPin4() {
  * Requires tables: pins_pool(app_public_id, pin, cashier_tg_id, customer_tg_id, style_id, status, created_at, used_at, used_by_tg, expires_at)
  * If your schema differs, errors will be logged clearly.
  */
+function randomPin4() {
+  return String(Math.floor(1000 + Math.random() * 9000)); // 1000..9999
+}
+
+// ⚠️ ВАЖНО: это 1:1 как в монолите (pins_pool: target_tg_id + issued_by_tg + issued_at)
 async function issuePinToCustomer(
   db: any,
   appPublicId: string,
@@ -131,30 +136,41 @@ async function issuePinToCustomer(
   customerTgId: string,
   styleId: string
 ) {
-  const pin = randomPin4();
-  try {
-    // try insert (common schema)
-    await db
-      .prepare(
-        `INSERT INTO pins_pool
-          (app_public_id, pin, cashier_tg_id, customer_tg_id, style_id, status, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, 'issued', datetime('now'), datetime('now', '+20 minutes'))`
-      )
-      .bind(String(appPublicId), String(pin), String(cashierTgId), String(customerTgId), String(styleId))
-      .run();
+  let pin = "";
+  for (let i = 0; i < 12; i++) {
+    pin = randomPin4();
+    try {
+      await db
+        .prepare(
+          `INSERT INTO pins_pool (app_public_id, pin, target_tg_id, style_id, issued_by_tg, issued_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))`
+        )
+        .bind(
+          String(appPublicId),
+          String(pin),
+          String(customerTgId),
+          String(styleId),
+          String(cashierTgId)
+        )
+        .run();
 
-    return { ok: true, pin };
-  } catch (e) {
-    // log and try fallback if table has different cols
-    logEvt("error", "pin.issue_failed", {
-      err: errObj(e),
-      appPublicId,
-      cashierTgId,
-      customerTgId,
-      styleId
-    });
-    return { ok: false, pin: null };
+      return { ok: true, pin };
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      // коллизия UNIQUE(app_public_id,pin) — пробуем ещё
+      if (/unique|constraint/i.test(msg)) continue;
+
+      logEvt("error", "pin.issue_failed", {
+        err: errObj(e),
+        appPublicId,
+        cashierTgId,
+        customerTgId,
+        styleId,
+      });
+      return { ok: false, error: "PIN_DB_ERROR" };
+    }
   }
+  return { ok: false, error: "PIN_CREATE_FAILED" };
 }
 
 // ================== TELEGRAM API HELPERS (LOCAL) ==================
