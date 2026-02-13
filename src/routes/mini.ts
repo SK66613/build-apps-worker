@@ -197,15 +197,29 @@ async function stylesTotalCount(db: any, appPublicId: string) {
 }
 
 async function passportCollectedCount(db: any, appPublicId: string, tgId: any, campaignId: string) {
-  const row = await db
-    .prepare(
-      `SELECT COUNT(DISTINCT style_id) as cnt
-       FROM styles_user
-       WHERE app_public_id = ? AND tg_id = ? AND campaign_id = ? AND status='collected'`
-    )
-    .bind(String(appPublicId), String(tgId), String(campaignId || ""))
-    .first();
-  return row ? Number((row as any).cnt || 0) : 0;
+  // campaign-aware, but backward compatible if column doesn't exist
+  try {
+    const row = await db
+      .prepare(
+        `SELECT COUNT(DISTINCT style_id) as cnt
+         FROM styles_user
+         WHERE app_public_id = ? AND tg_id = ? AND campaign_id = ? AND status='collected'`
+      )
+      .bind(String(appPublicId), String(tgId), String(campaignId || ""))
+      .first();
+    return row ? Number((row as any).cnt || 0) : 0;
+  } catch (e) {
+    // fallback to legacy schema (no campaign_id)
+    const row = await db
+      .prepare(
+        `SELECT COUNT(DISTINCT style_id) as cnt
+         FROM styles_user
+         WHERE app_public_id = ? AND tg_id = ? AND status='collected'`
+      )
+      .bind(String(appPublicId), String(tgId))
+      .first();
+    return row ? Number((row as any).cnt || 0) : 0;
+  }
 }
 
 // ================== COINS ==================
@@ -296,16 +310,31 @@ async function useOneTimePin(db: any, appPublicId: string, tgId: any, pin: any, 
 
 // ================== PASSPORT REWARD ==================
 async function passportGetIssued(db: any, appPublicId: string, tgId: any, passportKey: string, campaignId: string) {
-  return await db
-    .prepare(
-      `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at, wheel_campaign_id, campaign_id
-       FROM passport_rewards
-       WHERE app_public_id=? AND tg_id=? AND passport_key=? AND campaign_id=? AND status='issued'
-       ORDER BY id DESC
-       LIMIT 1`
-    )
-    .bind(String(appPublicId), String(tgId), String(passportKey || "default"), String(campaignId || ""))
-    .first();
+  // campaign-aware, but backward compatible if columns don't exist
+  try {
+    return await db
+      .prepare(
+        `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at, wheel_campaign_id, campaign_id
+         FROM passport_rewards
+         WHERE app_public_id=? AND tg_id=? AND passport_key=? AND campaign_id=? AND status='issued'
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .bind(String(appPublicId), String(tgId), String(passportKey || "default"), String(campaignId || ""))
+      .first();
+  } catch (e) {
+    // legacy schema (no campaign_id / wheel_campaign_id)
+    return await db
+      .prepare(
+        `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
+         FROM passport_rewards
+         WHERE app_public_id=? AND tg_id=? AND passport_key=? AND status='issued'
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .bind(String(appPublicId), String(tgId), String(passportKey || "default"))
+      .first();
+  }
 }
 
 
@@ -330,33 +359,47 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
   const prizeCode = String((rewardObj?.prize_code || cfg?.passport?.reward_prize_code || "")).trim();
   if (!prizeCode) return { ok: true, skipped: true, reason: "NO_REWARD_PRIZE_CODE" };
 
-  const snapTitle = String(rewardObj?.prize_title || "").trim();
-  const snapCoins = Math.max(0, Math.floor(Number(rewardObj?.coins || 0)));
-  const wheelCampaignId = String(rewardObj?.wheel_campaign_id || "").trim();
-
   const total = await stylesTotalCount(db, ctx.publicId);
   if (!total) return { ok: true, skipped: true, reason: "NO_STYLES_TOTAL" };
 
   const got = await passportCollectedCount(db, ctx.publicId, tgId, passportCampaignId);
   if (got < total) return { ok: true, skipped: true, reason: "NOT_COMPLETED", got, total };
 
-  // ✅ если уже есть issued в рамках ЭТОЙ кампании — не плодим
-  const existingIssued: any = await db
-    .prepare(
-      `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at, campaign_id, wheel_campaign_id
-       FROM passport_rewards
-       WHERE app_public_id=? AND tg_id=? AND passport_key=? AND campaign_id=? AND status='issued'
-       ORDER BY id DESC
-       LIMIT 1`
-    )
-    .bind(ctx.publicId, String(tgId), passportKey, passportCampaignId)
-    .first();
+  // ✅ если уже есть issued — не плодим (campaign-aware если поддерживается)
+  let existingIssued: any = null;
+  try {
+    existingIssued = await db
+      .prepare(
+        `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at, campaign_id, wheel_campaign_id
+         FROM passport_rewards
+         WHERE app_public_id=? AND tg_id=? AND passport_key=? AND campaign_id=? AND status='issued'
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .bind(ctx.publicId, String(tgId), passportKey, passportCampaignId)
+      .first();
+  } catch (_) {
+    existingIssued = await db
+      .prepare(
+        `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
+         FROM passport_rewards
+         WHERE app_public_id=? AND tg_id=? AND passport_key=? AND status='issued'
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .bind(ctx.publicId, String(tgId), passportKey)
+      .first();
+  }
 
   if (existingIssued) {
     return { ok: true, issued: true, reused: true, reward: existingIssued, got, total };
   }
 
   // ✅ prize snapshot first; fallback to current wheel_prizes only if snapshot missing
+  const snapTitle = String(rewardObj?.prize_title || "").trim();
+  const snapCoins = Math.max(0, Math.floor(Number(rewardObj?.coins || 0)));
+  const wheelCampaignId = String(rewardObj?.wheel_campaign_id || "").trim();
+
   let prizeTitle = snapTitle;
   let prizeCoins = snapCoins;
 
@@ -372,40 +415,64 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
     prizeCoins = Math.max(0, Math.floor(Number(pr.coins || 0)));
   }
 
-  // ✅ создаём НОВУЮ строку в passport_rewards (история) + campaign_id
+  // ✅ создаём НОВУЮ строку в passport_rewards (история)
   let redeemCode = "";
   for (let i = 0; i < 8; i++) {
     redeemCode = randomRedeemCode(10);
     try {
-      await db
-        .prepare(
-          `INSERT INTO passport_rewards
-           (app_id, app_public_id, tg_id, passport_key, campaign_id, prize_code, prize_title, coins, wheel_campaign_id, redeem_code, status, issued_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
-        )
-        .bind(
-          ctx.appId,
-          ctx.publicId,
-          String(tgId),
-          passportKey,
-          passportCampaignId,
-          prizeCode,
-          prizeTitle,
-          prizeCoins,
-          wheelCampaignId,
-          redeemCode
-        )
-        .run();
+      // сначала пробуем расширенную схему
+      await db.prepare(
+        `INSERT INTO passport_rewards
+         (app_id, app_public_id, tg_id, passport_key, campaign_id, wheel_campaign_id, prize_code, prize_title, coins, redeem_code, status, issued_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
+      ).bind(
+        ctx.appId,
+        ctx.publicId,
+        String(tgId),
+        passportKey,
+        passportCampaignId,
+        wheelCampaignId || null,
+        prizeCode,
+        prizeTitle,
+        prizeCoins,
+        redeemCode
+      ).run();
       break;
     } catch (e: any) {
       const msg = String(e?.message || e);
+
+      // fallback на legacy схему (без campaign_id/wheel_campaign_id)
+      if (/no such column: campaign_id|no such column: wheel_campaign_id/i.test(msg)) {
+        try {
+          await db.prepare(
+            `INSERT INTO passport_rewards
+             (app_id, app_public_id, tg_id, passport_key, prize_code, prize_title, coins, redeem_code, status, issued_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
+          ).bind(
+            ctx.appId,
+            ctx.publicId,
+            String(tgId),
+            passportKey,
+            prizeCode,
+            prizeTitle,
+            prizeCoins,
+            redeemCode
+          ).run();
+          break;
+        } catch (e2: any) {
+          const msg2 = String(e2?.message || e2);
+          if (/unique|constraint/i.test(msg2)) continue;
+          throw e2;
+        }
+      }
+
       if (/unique|constraint/i.test(msg)) continue;
       throw e;
     }
   }
   if (!redeemCode) return { ok: false, error: "PASSPORT_REDEEM_CREATE_FAILED" };
 
-  // Сообщение пользователю
+  // Сообщение пользователю (как у тебя)
   const botToken = await getBotTokenForApp(ctx.publicId, env, ctx.appId).catch(() => null);
 
   let botUsername = "";
@@ -427,10 +494,12 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
         prizeCoins > 0 ? `🪙 Монеты: <b>${prizeCoins}</b> (после подтверждения кассиром)` : "",
         ``,
         `✅ Код выдачи: <code>${redeemCode}</code>`,
-        deepLink ? `Откройте ссылку:\n${deepLink}` : `Покажите код кассиру.`,
+        deepLink ? `Откройте ссылку:
+${deepLink}` : `Покажите код кассиру.`,
       ].filter(Boolean);
 
-      await tgSendMessage(env, botToken, String(tgId), lines.join("\n"), {}, { appPublicId: ctx.publicId, tgUserId: String(tgId) });
+      await tgSendMessage(env, botToken, String(tgId), lines.join("
+"), {}, { appPublicId: ctx.publicId, tgUserId: String(tgId) });
     }
   } catch (e) {
     console.error("[passport.reward] tgSendMessage redeem failed", e);
@@ -439,9 +508,9 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
   return {
     ok: true,
     issued: true,
-    reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode, campaign_id: passportCampaignId },
+    reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode, campaign_id: passportCampaignId, wheel_campaign_id: wheelCampaignId || "" },
     got,
-    total,
+    total
   };
 }
 
@@ -605,10 +674,9 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
     passport_reward: null,
   };
 
-  // passport campaign scope
-  const passportKey = String(cfg?.passport?.passport_key || "default");
-  const passportCampaignId = String(cfg?.passport?.campaign_id || passportKey || "default");
-
+  // passport campaign (new schema) — backward compatible
+  const _passportKey = String(cfg?.passport?.passport_key || "default");
+  const _passportCampaignId = String(cfg?.passport?.campaign_id || _passportKey || "default");
 
   // bot username for referral links (active bot)
   try {
@@ -645,7 +713,7 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
        AND (claim_status IS NULL OR claim_status = 'ok')
        ORDER BY id DESC LIMIT 10`
     )
-    .bind(appPublicId, String(tgId), passportCampaignId)
+    .bind(appPublicId, String(tgId))
     .all();
 
   out.last_prizes = (lp.results || []).map((r: any) => ({
@@ -655,22 +723,36 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
     ts: r.ts || nowISO(),
   }));
 
-  // styles_user
-  const su = await db
+  // styles_user (campaign-aware if supported)
+let su: any = { results: [] };
+try {
+  su = await db
     .prepare(
       `SELECT style_id, status, ts
        FROM styles_user
        WHERE app_public_id = ? AND tg_id = ? AND campaign_id = ? AND status = 'collected'
        ORDER BY ts DESC`
     )
-    .bind(appPublicId, String(tgId), passportCampaignId)
+    .bind(appPublicId, String(tgId), _passportCampaignId)
     .all();
+} catch (e) {
+  // legacy schema
+  su = await db
+    .prepare(
+      `SELECT style_id, status, ts
+       FROM styles_user
+       WHERE app_public_id = ? AND tg_id = ? AND status = 'collected'
+       ORDER BY ts DESC`
+    )
+    .bind(appPublicId, String(tgId))
+    .all();
+}
 
-  out.styles_user = (su.results || []).map((r: any) => ({
-    style_id: String(r.style_id || ""),
-    status: String(r.status || "collected"),
-    ts: r.ts || "",
-  }));
+out.styles_user = (su.results || []).map((r: any) => ({
+  style_id: String(r.style_id || ""),
+  status: String(r.status || "collected"),
+  ts: r.ts || "",
+}));
 
   let lastTs = 0,
     lastSid = "";
@@ -695,7 +777,7 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
 
   // passport reward snapshot (if issued)
   try {
-    const rw = await passportGetIssued(db, appPublicId, tgId, passportKey, passportCampaignId);
+    const rw = await passportGetIssued(db, appPublicId, tgId, "default", _passportCampaignId);
     out.passport_reward = rw
       ? {
           prize_code: String((rw as any).prize_code || ""),
@@ -1119,32 +1201,34 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
   }
 
   // ====== style collect
-  if (type === "style.collect" || type === "style_collect") {
-    const styleId = String((payload && (payload.style_id || payload.styleId || payload.code)) || "").trim();
-    const pin = String((payload && payload.pin) || "").trim();
-    if (!styleId) return json({ ok: false, error: "NO_STYLE_ID" }, 400, request);
+if (type === "style.collect" || type === "style_collect") {
+  const styleId = String((payload && (payload.style_id || payload.styleId || payload.code)) || "").trim();
+  const pin = String((payload && payload.pin) || "").trim();
+  if (!styleId) return json({ ok: false, error: "NO_STYLE_ID" }, 400, request);
 
-    const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
-    const cfg =
-      (appObj as any) && ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
-        ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
-        : {};
+  const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
+  const cfg =
+    (appObj as any) && ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+      ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
+      : {};
 
-    // ✅ PIN всегда включен (редактор убрал переключатель). Оставляем совместимость: если require_pin=false — не проверяем.
-    const requirePin = cfg?.passport?.require_pin === undefined ? true : !!cfg?.passport?.require_pin;
+  // PIN в паспорте по умолчанию включён (совместимость со старым cfg)
+  const requirePin = cfg?.passport?.require_pin === undefined ? true : !!(cfg && cfg.passport && cfg.passport.require_pin);
 
-    if (requirePin) {
-      const pres = await useOneTimePin(db, (ctx as any).publicId, tg.id, pin, styleId);
-      if (!pres || !(pres as any).ok) return json(pres || { ok: false, error: "pin_invalid" }, 400, request);
-    }
+  if (requirePin) {
+    const pres = await useOneTimePin(db, (ctx as any).publicId, tg.id, pin, styleId);
+    if (!pres || !(pres as any).ok) return json(pres || { ok: false, error: "pin_invalid" }, 400, request);
+  }
 
-    // ✅ campaign_id (новая акция = новый campaign_id)
-    const passportKey = String(cfg?.passport?.passport_key || "default");
-    const passportCampaignId = String(cfg?.passport?.campaign_id || passportKey || "default");
+  // campaign_id (если поддерживается схемой)
+  const passportKey = String(cfg?.passport?.passport_key || "default");
+  const passportCampaignId = String(cfg?.passport?.campaign_id || passportKey || "default");
 
-    // ✅ 1) upsert collected (idempotent) + не начислять монеты повторно
-    let didCollect = false;
+  // 1) upsert collected (idempotent)
+  let didCollect = false;
 
+  // try new schema with campaign_id, fallback to legacy schema without it
+  try {
     const up = await db
       .prepare(
         `UPDATE styles_user
@@ -1172,44 +1256,78 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
         else throw e;
       }
     }
+  } catch (e: any) {
+    // legacy schema
+    const up = await db
+      .prepare(
+        `UPDATE styles_user
+         SET status='collected', ts=datetime('now')
+         WHERE app_public_id=? AND tg_id=? AND style_id=?`
+      )
+      .bind((ctx as any).publicId, String(tg.id), styleId)
+      .run();
 
-    // ✅ 2) монеты за каждый штамп (server-side), только если штамп реально НОВЫЙ
-    const perStampCoins = Math.max(0, Math.floor(Number(cfg?.passport?.collect_coins || 0)));
-    if (didCollect && perStampCoins > 0) {
+    if (up?.meta?.changes) {
+      didCollect = true;
+    } else {
       try {
-        await awardCoins(
-          db,
-          (ctx as any).appId,
-          (ctx as any).publicId,
-          String(tg.id),
-          perStampCoins,
-          "passport_stamp_collect",
-          String(styleId),
-          `stamp:${String(styleId)}`,
-          `passport:stamp:${(ctx as any).publicId}:${tg.id}:${passportCampaignId}:${styleId}:${perStampCoins}`
-        );
-      } catch (e) {
-        console.error("[passport.collect_coins] awardCoins failed", e);
+        await db
+          .prepare(
+            `INSERT INTO styles_user (app_id, app_public_id, tg_id, style_id, status, ts)
+             VALUES (?, ?, ?, ?, 'collected', datetime('now'))`
+          )
+          .bind((ctx as any).appId, (ctx as any).publicId, String(tg.id), styleId)
+          .run();
+        didCollect = true;
+      } catch (e2: any) {
+        const msg2 = String(e2?.message || e2);
+        if (/unique|constraint/i.test(msg2)) didCollect = false;
+        else throw e2;
       }
     }
-
-    // ✅ 3) если собрал всё — выдаём приз (campaign-aware + snapshot-aware)
-    try {
-      await passportIssueRewardIfCompleted(db, env, ctx, tg.id, cfg);
-    } catch (e) {
-      console.error("[passport.reward] failed", e);
-    }
-
-    const fresh = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
-    return json(
-      { ok: true, style_id: styleId, campaign_id: passportCampaignId, collected: didCollect, coins_awarded: didCollect ? perStampCoins : 0, fresh_state: fresh },
-      200,
-      request
-    );
   }
 
+  // 2) coins per stamp (cfg.passport.collect_coins), only if stamp is NEW
+  const perStampCoins = Math.max(0, Math.floor(Number(cfg?.passport?.collect_coins || 0)));
+  if (didCollect && perStampCoins > 0) {
+    try {
+      await awardCoins(
+        db,
+        (ctx as any).appId,
+        (ctx as any).publicId,
+        String(tg.id),
+        perStampCoins,
+        "passport_stamp_collect",
+        String(styleId),
+        `stamp:${String(styleId)}`,
+        `passport:stamp:${(ctx as any).publicId}:${tg.id}:${passportCampaignId}:${styleId}:${perStampCoins}`
+      );
+    } catch (e3) {
+      console.error("[passport.collect_coins] awardCoins failed", e3);
+    }
+  }
 
-  // ====== pin_use
+  try {
+    await passportIssueRewardIfCompleted(db, env, ctx, tg.id, cfg);
+  } catch (e4) {
+    console.error("[passport.reward] failed", e4);
+  }
+
+  const fresh = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
+  return json(
+    {
+      ok: true,
+      style_id: styleId,
+      collected: didCollect,
+      coins_awarded: didCollect ? perStampCoins : 0,
+      fresh_state: fresh,
+    },
+    200,
+    request
+  );
+}
+
+// ====== pin_use
   if (type === "pin_use") {
     const { pin, style_id } = payload || {};
     const res = await useOneTimePin(db, (ctx as any).publicId, tg.id, pin, style_id);
