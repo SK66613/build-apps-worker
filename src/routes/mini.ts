@@ -427,12 +427,10 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
         prizeCoins > 0 ? `🪙 Монеты: <b>${prizeCoins}</b> (после подтверждения кассиром)` : "",
         ``,
         `✅ Код выдачи: <code>${redeemCode}</code>`,
-        deepLink ? `Откройте ссылку:
-${deepLink}` : `Покажите код кассиру.`,
+        deepLink ? `Откройте ссылку:\n${deepLink}` : `Покажите код кассиру.`,
       ].filter(Boolean);
 
-      await tgSendMessage(env, botToken, String(tgId), lines.join("
-"), {}, { appPublicId: ctx.publicId, tgUserId: String(tgId) });
+      await tgSendMessage(env, botToken, String(tgId), lines.join("\n"), {}, { appPublicId: ctx.publicId, tgUserId: String(tgId) });
     }
   } catch (e) {
     console.error("[passport.reward] tgSendMessage redeem failed", e);
@@ -1211,7 +1209,34 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
   }
 
 
+    const up = await db
+      .prepare(
+        `UPDATE styles_user
+         SET status='collected', ts=datetime('now')
+         WHERE app_public_id=? AND tg_id=? AND style_id=?`
+      )
+      .bind((ctx as any).publicId, String(tg.id), styleId)
+      .run();
 
+    if (!up || !up.meta || !up.meta.changes) {
+      await db
+        .prepare(
+          `INSERT INTO styles_user (app_id, app_public_id, tg_id, style_id, status, ts)
+           VALUES (?, ?, ?, ?, 'collected', datetime('now'))`
+        )
+        .bind((ctx as any).appId, (ctx as any).publicId, String(tg.id), styleId)
+        .run();
+    }
+
+    try {
+      await passportIssueRewardIfCompleted(db, env, ctx, tg.id, cfg);
+    } catch (e) {
+      console.error("[passport.reward] failed", e);
+    }
+
+    const fresh = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
+    return json({ ok: true, style_id: styleId, fresh_state: fresh }, 200, request);
+  }
 
   // ====== pin_use
   if (type === "pin_use") {
