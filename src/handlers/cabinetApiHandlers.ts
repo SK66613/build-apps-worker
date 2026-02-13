@@ -251,21 +251,23 @@ await env.APPS.put(liveKey, JSON.stringify(bp));
     console.error("[sales_settings] sync on publish failed", e);
   }
 
-// runtime config: ALWAYS derive from blueprint on publish (so edits reflect in D1)
-let runtimeCfg = extractRuntimeConfigFromBlueprint(bp || null);
+  // runtime config: use stored or derive from blueprint
+  let runtimeCfg = appObj.app_config ?? appObj.runtime_config ?? null;
+  const looksEmpty =
+    !runtimeCfg ||
+    typeof runtimeCfg !== "object" ||
+    Object.keys(runtimeCfg).length === 0 ||
+    ((runtimeCfg.wheel && Array.isArray(runtimeCfg.wheel.prizes) && runtimeCfg.wheel.prizes.length === 0) &&
+      (runtimeCfg.passport && Array.isArray(runtimeCfg.passport.styles) && runtimeCfg.passport.styles.length === 0));
 
-// persist runtimeCfg into app object (so mini/state uses freshest config)
-appObj.app_config = runtimeCfg;
-try {
-  await env.APPS.put("app:" + appId, JSON.stringify(appObj));
-} catch (_) {}
+  if (looksEmpty) {
+    runtimeCfg = extractRuntimeConfigFromBlueprint(bp || null);
 
-// (optional) light debug in response
-// runtimeCfg.__debug = {
-//   wheel_prizes: Array.isArray(runtimeCfg?.wheel?.prizes) ? runtimeCfg.wheel.prizes.length : 0,
-//   passport_styles: Array.isArray(runtimeCfg?.passport?.styles) ? runtimeCfg.passport.styles.length : 0,
-// };
-
+    appObj.app_config = runtimeCfg;
+    try {
+      await env.APPS.put("app:" + appId, JSON.stringify(appObj));
+    } catch (_) {}
+  }
 
   const syncStats = await syncRuntimeTablesFromConfig(appId, appObj.publicId, runtimeCfg, env);
   const publicUrl = "https://mini.salesgenius.ru/m/" + encodeURIComponent(appObj.publicId);
