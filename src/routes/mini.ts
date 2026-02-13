@@ -498,8 +498,7 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
 ${deepLink}` : `Покажите код кассиру.`,
       ].filter(Boolean);
 
-      await tgSendMessage(env, botToken, String(tgId), lines.join("
-"), {}, { appPublicId: ctx.publicId, tgUserId: String(tgId) });
+      await tgSendMessage(env, botToken, String(tgId), lines.join("\n"), {}, { appPublicId: ctx.publicId, tgUserId: String(tgId) });
     }
   } catch (e) {
     console.error("[passport.reward] tgSendMessage redeem failed", e);
