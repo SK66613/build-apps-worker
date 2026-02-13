@@ -79,3 +79,4 @@ export async function syncRuntimeTablesFromConfig(appId: any, publicId: string, 
   }
   return out;
 }
+
