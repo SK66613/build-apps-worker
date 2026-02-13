@@ -196,30 +196,16 @@ async function stylesTotalCount(db: any, appPublicId: string) {
   return row ? Number((row as any).cnt || 0) : 0;
 }
 
-async function passportCollectedCount(db: any, appPublicId: string, tgId: any, campaignId: string) {
-  // campaign-aware, but backward compatible if column doesn't exist
-  try {
-    const row = await db
-      .prepare(
-        `SELECT COUNT(DISTINCT style_id) as cnt
-         FROM styles_user
-         WHERE app_public_id = ? AND tg_id = ? AND campaign_id = ? AND status='collected'`
-      )
-      .bind(String(appPublicId), String(tgId), String(campaignId || ""))
-      .first();
-    return row ? Number((row as any).cnt || 0) : 0;
-  } catch (e) {
-    // fallback to legacy schema (no campaign_id)
-    const row = await db
-      .prepare(
-        `SELECT COUNT(DISTINCT style_id) as cnt
-         FROM styles_user
-         WHERE app_public_id = ? AND tg_id = ? AND status='collected'`
-      )
-      .bind(String(appPublicId), String(tgId))
-      .first();
-    return row ? Number((row as any).cnt || 0) : 0;
-  }
+async function passportCollectedCount(db: any, appPublicId: string, tgId: any) {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT style_id) as cnt
+       FROM styles_user
+       WHERE app_public_id = ? AND tg_id = ? AND status='collected'`
+    )
+    .bind(String(appPublicId), String(tgId))
+    .first();
+  return row ? Number((row as any).cnt || 0) : 0;
 }
 
 // ================== COINS ==================
@@ -309,32 +295,17 @@ async function useOneTimePin(db: any, appPublicId: string, tgId: any, pin: any, 
 }
 
 // ================== PASSPORT REWARD ==================
-async function passportGetIssued(db: any, appPublicId: string, tgId: any, passportKey: string, campaignId: string) {
-  // campaign-aware, but backward compatible if columns don't exist
-  try {
-    return await db
-      .prepare(
-        `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at, wheel_campaign_id, campaign_id
-         FROM passport_rewards
-         WHERE app_public_id=? AND tg_id=? AND passport_key=? AND campaign_id=? AND status='issued'
-         ORDER BY id DESC
-         LIMIT 1`
-      )
-      .bind(String(appPublicId), String(tgId), String(passportKey || "default"), String(campaignId || ""))
-      .first();
-  } catch (e) {
-    // legacy schema (no campaign_id / wheel_campaign_id)
-    return await db
-      .prepare(
-        `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
-         FROM passport_rewards
-         WHERE app_public_id=? AND tg_id=? AND passport_key=? AND status='issued'
-         ORDER BY id DESC
-         LIMIT 1`
-      )
-      .bind(String(appPublicId), String(tgId), String(passportKey || "default"))
-      .first();
-  }
+async function passportGetIssued(db: any, appPublicId: string, tgId: any, passportKey: string) {
+  return await db
+    .prepare(
+      `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
+       FROM passport_rewards
+       WHERE app_public_id=? AND tg_id=? AND passport_key=? AND status='issued'
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .bind(appPublicId, String(tgId), String(passportKey || "default"))
+    .first();
 }
 
 
@@ -348,90 +319,53 @@ function randomRedeemCode(len = 10) {
 
 async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId: any, cfg: any) {
   const passportKey = String(cfg?.passport?.passport_key || "default");
-
-  // ✅ campaign_id паспорта (новая акция = новый campaign_id)
-  const passportCampaignId = String(cfg?.passport?.campaign_id || passportKey || "default");
-
-  // ✅ reward snapshot (чтобы изменения колеса потом не ломали паспорт)
-  const rewardObj = cfg?.passport?.reward && typeof cfg.passport.reward === "object" ? cfg.passport.reward : null;
-
-  // legacy fallback (поддержка старых конфигов)
-  const prizeCode = String((rewardObj?.prize_code || cfg?.passport?.reward_prize_code || "")).trim();
+  const prizeCode = String(cfg?.passport?.reward_prize_code || "").trim();
   if (!prizeCode) return { ok: true, skipped: true, reason: "NO_REWARD_PRIZE_CODE" };
 
   const total = await stylesTotalCount(db, ctx.publicId);
   if (!total) return { ok: true, skipped: true, reason: "NO_STYLES_TOTAL" };
 
-  const got = await passportCollectedCount(db, ctx.publicId, tgId, passportCampaignId);
+  const got = await passportCollectedCount(db, ctx.publicId, tgId);
   if (got < total) return { ok: true, skipped: true, reason: "NOT_COMPLETED", got, total };
 
-  // ✅ если уже есть issued — не плодим (campaign-aware если поддерживается)
-  let existingIssued: any = null;
-  try {
-    existingIssued = await db
-      .prepare(
-        `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at, campaign_id, wheel_campaign_id
-         FROM passport_rewards
-         WHERE app_public_id=? AND tg_id=? AND passport_key=? AND campaign_id=? AND status='issued'
-         ORDER BY id DESC
-         LIMIT 1`
-      )
-      .bind(ctx.publicId, String(tgId), passportKey, passportCampaignId)
-      .first();
-  } catch (_) {
-    existingIssued = await db
-      .prepare(
-        `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
-         FROM passport_rewards
-         WHERE app_public_id=? AND tg_id=? AND passport_key=? AND status='issued'
-         ORDER BY id DESC
-         LIMIT 1`
-      )
-      .bind(ctx.publicId, String(tgId), passportKey)
-      .first();
-  }
+  // ✅ 1) если уже есть НЕВЫДАННЫЙ приз (issued) — не плодим новые строки
+  const existingIssued: any = await db.prepare(
+    `SELECT id, prize_code, prize_title, coins, redeem_code, status, issued_at
+     FROM passport_rewards
+     WHERE app_public_id=? AND tg_id=? AND passport_key=? AND status='issued'
+     ORDER BY id DESC
+     LIMIT 1`
+  ).bind(ctx.publicId, String(tgId), passportKey).first();
 
   if (existingIssued) {
     return { ok: true, issued: true, reused: true, reward: existingIssued, got, total };
   }
 
-  // ✅ prize snapshot first; fallback to current wheel_prizes only if snapshot missing
-  const snapTitle = String(rewardObj?.prize_title || "").trim();
-  const snapCoins = Math.max(0, Math.floor(Number(rewardObj?.coins || 0)));
-  const wheelCampaignId = String(rewardObj?.wheel_campaign_id || "").trim();
+  // ✅ 2) берём приз из wheel_prizes (как у тебя)
+  const pr: any = await db
+    .prepare(`SELECT code, title, coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`)
+    .bind(ctx.publicId, prizeCode)
+    .first();
 
-  let prizeTitle = snapTitle;
-  let prizeCoins = snapCoins;
+  if (!pr) return { ok: false, error: "REWARD_PRIZE_NOT_FOUND", prize_code: prizeCode };
 
-  if (!prizeTitle) {
-    const pr: any = await db
-      .prepare(`SELECT code, title, coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`)
-      .bind(ctx.publicId, prizeCode)
-      .first();
+  const prizeTitle = String(pr.title || prizeCode);
+  const prizeCoins = Math.max(0, Math.floor(Number(pr.coins || 0)));
 
-    if (!pr) return { ok: false, error: "REWARD_PRIZE_NOT_FOUND", prize_code: prizeCode };
-
-    prizeTitle = String(pr.title || prizeCode);
-    prizeCoins = Math.max(0, Math.floor(Number(pr.coins || 0)));
-  }
-
-  // ✅ создаём НОВУЮ строку в passport_rewards (история)
+  // ✅ 3) создаём НОВУЮ строку в passport_rewards (история)
   let redeemCode = "";
   for (let i = 0; i < 8; i++) {
     redeemCode = randomRedeemCode(10);
     try {
-      // сначала пробуем расширенную схему
       await db.prepare(
         `INSERT INTO passport_rewards
-         (app_id, app_public_id, tg_id, passport_key, campaign_id, wheel_campaign_id, prize_code, prize_title, coins, redeem_code, status, issued_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
+         (app_id, app_public_id, tg_id, passport_key, prize_code, prize_title, coins, redeem_code, status, issued_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
       ).bind(
         ctx.appId,
         ctx.publicId,
         String(tgId),
         passportKey,
-        passportCampaignId,
-        wheelCampaignId || null,
         prizeCode,
         prizeTitle,
         prizeCoins,
@@ -440,32 +374,6 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
       break;
     } catch (e: any) {
       const msg = String(e?.message || e);
-
-      // fallback на legacy схему (без campaign_id/wheel_campaign_id)
-      if (/no such column: campaign_id|no such column: wheel_campaign_id/i.test(msg)) {
-        try {
-          await db.prepare(
-            `INSERT INTO passport_rewards
-             (app_id, app_public_id, tg_id, passport_key, prize_code, prize_title, coins, redeem_code, status, issued_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))`
-          ).bind(
-            ctx.appId,
-            ctx.publicId,
-            String(tgId),
-            passportKey,
-            prizeCode,
-            prizeTitle,
-            prizeCoins,
-            redeemCode
-          ).run();
-          break;
-        } catch (e2: any) {
-          const msg2 = String(e2?.message || e2);
-          if (/unique|constraint/i.test(msg2)) continue;
-          throw e2;
-        }
-      }
-
       if (/unique|constraint/i.test(msg)) continue;
       throw e;
     }
@@ -494,8 +402,7 @@ async function passportIssueRewardIfCompleted(db: any, env: Env, ctx: any, tgId:
         prizeCoins > 0 ? `🪙 Монеты: <b>${prizeCoins}</b> (после подтверждения кассиром)` : "",
         ``,
         `✅ Код выдачи: <code>${redeemCode}</code>`,
-        deepLink ? `Откройте ссылку:
-${deepLink}` : `Покажите код кассиру.`,
+        deepLink ? `Откройте ссылку:\n${deepLink}` : `Покажите код кассиру.`,
       ].filter(Boolean);
 
       await tgSendMessage(env, botToken, String(tgId), lines.join("\n"), {}, { appPublicId: ctx.publicId, tgUserId: String(tgId) });
@@ -507,7 +414,7 @@ ${deepLink}` : `Покажите код кассиру.`,
   return {
     ok: true,
     issued: true,
-    reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode, campaign_id: passportCampaignId, wheel_campaign_id: wheelCampaignId || "" },
+    reward: { prize_code: prizeCode, prize_title: prizeTitle, coins: prizeCoins, redeem_code: redeemCode },
     got,
     total
   };
@@ -673,10 +580,6 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
     passport_reward: null,
   };
 
-  // passport campaign (new schema) — backward compatible
-  const _passportKey = String(cfg?.passport?.passport_key || "default");
-  const _passportCampaignId = String(cfg?.passport?.campaign_id || _passportKey || "default");
-
   // bot username for referral links (active bot)
   try {
     const pid = String(appPublicId || "").trim();
@@ -722,21 +625,8 @@ async function buildState(db: any, appId: any, appPublicId: string, tgId: any, c
     ts: r.ts || nowISO(),
   }));
 
-  // styles_user (campaign-aware if supported)
-let su: any = { results: [] };
-try {
-  su = await db
-    .prepare(
-      `SELECT style_id, status, ts
-       FROM styles_user
-       WHERE app_public_id = ? AND tg_id = ? AND campaign_id = ? AND status = 'collected'
-       ORDER BY ts DESC`
-    )
-    .bind(appPublicId, String(tgId), _passportCampaignId)
-    .all();
-} catch (e) {
-  // legacy schema
-  su = await db
+  // styles_user
+  const su = await db
     .prepare(
       `SELECT style_id, status, ts
        FROM styles_user
@@ -745,13 +635,12 @@ try {
     )
     .bind(appPublicId, String(tgId))
     .all();
-}
 
-out.styles_user = (su.results || []).map((r: any) => ({
-  style_id: String(r.style_id || ""),
-  status: String(r.status || "collected"),
-  ts: r.ts || "",
-}));
+  out.styles_user = (su.results || []).map((r: any) => ({
+    style_id: String(r.style_id || ""),
+    status: String(r.status || "collected"),
+    ts: r.ts || "",
+  }));
 
   let lastTs = 0,
     lastSid = "";
@@ -776,7 +665,7 @@ out.styles_user = (su.results || []).map((r: any) => ({
 
   // passport reward snapshot (if issued)
   try {
-    const rw = await passportGetIssued(db, appPublicId, tgId, "default", _passportCampaignId);
+    const rw = await passportGetIssued(db, appPublicId, tgId, "default");
     out.passport_reward = rw
       ? {
           prize_code: String((rw as any).prize_code || ""),
@@ -1200,63 +1089,20 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
   }
 
   // ====== style collect
-if (type === "style.collect" || type === "style_collect") {
-  const styleId = String((payload && (payload.style_id || payload.styleId || payload.code)) || "").trim();
-  const pin = String((payload && payload.pin) || "").trim();
-  if (!styleId) return json({ ok: false, error: "NO_STYLE_ID" }, 400, request);
+  if (type === "style.collect" || type === "style_collect") {
+    const styleId = String((payload && (payload.style_id || payload.styleId || payload.code)) || "").trim();
+    const pin = String((payload && payload.pin) || "").trim();
+    if (!styleId) return json({ ok: false, error: "NO_STYLE_ID" }, 400, request);
 
-  const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
-  const cfg =
-    (appObj as any) && ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
-      ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
-      : {};
+    const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
+    const cfg = (appObj as any) && ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config) ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config) : {};
+    const requirePin = !!(cfg && cfg.passport && cfg.passport.require_pin);
 
-  // PIN в паспорте по умолчанию включён (совместимость со старым cfg)
-  const requirePin = cfg?.passport?.require_pin === undefined ? true : !!(cfg && cfg.passport && cfg.passport.require_pin);
-
-  if (requirePin) {
-    const pres = await useOneTimePin(db, (ctx as any).publicId, tg.id, pin, styleId);
-    if (!pres || !(pres as any).ok) return json(pres || { ok: false, error: "pin_invalid" }, 400, request);
-  }
-
-  // campaign_id (если поддерживается схемой)
-  const passportKey = String(cfg?.passport?.passport_key || "default");
-  const passportCampaignId = String(cfg?.passport?.campaign_id || passportKey || "default");
-
-  // 1) upsert collected (idempotent)
-  let didCollect = false;
-
-  // try new schema with campaign_id, fallback to legacy schema without it
-  try {
-    const up = await db
-      .prepare(
-        `UPDATE styles_user
-         SET status='collected', ts=datetime('now')
-         WHERE app_public_id=? AND tg_id=? AND campaign_id=? AND style_id=? AND status!='collected'`
-      )
-      .bind((ctx as any).publicId, String(tg.id), passportCampaignId, styleId)
-      .run();
-
-    if (up?.meta?.changes) {
-      didCollect = true;
-    } else {
-      try {
-        await db
-          .prepare(
-            `INSERT INTO styles_user (app_id, app_public_id, tg_id, campaign_id, style_id, status, ts)
-             VALUES (?, ?, ?, ?, ?, 'collected', datetime('now'))`
-          )
-          .bind((ctx as any).appId, (ctx as any).publicId, String(tg.id), passportCampaignId, styleId)
-          .run();
-        didCollect = true;
-      } catch (e: any) {
-        const msg = String(e?.message || e);
-        if (/unique|constraint/i.test(msg)) didCollect = false;
-        else throw e;
-      }
+    if (requirePin) {
+      const pres = await useOneTimePin(db, (ctx as any).publicId, tg.id, pin, styleId);
+      if (!pres || !(pres as any).ok) return json(pres || { ok: false, error: "pin_invalid" }, 400, request);
     }
-  } catch (e: any) {
-    // legacy schema
+
     const up = await db
       .prepare(
         `UPDATE styles_user
@@ -1266,67 +1112,27 @@ if (type === "style.collect" || type === "style_collect") {
       .bind((ctx as any).publicId, String(tg.id), styleId)
       .run();
 
-    if (up?.meta?.changes) {
-      didCollect = true;
-    } else {
-      try {
-        await db
-          .prepare(
-            `INSERT INTO styles_user (app_id, app_public_id, tg_id, style_id, status, ts)
-             VALUES (?, ?, ?, ?, 'collected', datetime('now'))`
-          )
-          .bind((ctx as any).appId, (ctx as any).publicId, String(tg.id), styleId)
-          .run();
-        didCollect = true;
-      } catch (e2: any) {
-        const msg2 = String(e2?.message || e2);
-        if (/unique|constraint/i.test(msg2)) didCollect = false;
-        else throw e2;
-      }
+    if (!up || !up.meta || !up.meta.changes) {
+      await db
+        .prepare(
+          `INSERT INTO styles_user (app_id, app_public_id, tg_id, style_id, status, ts)
+           VALUES (?, ?, ?, ?, 'collected', datetime('now'))`
+        )
+        .bind((ctx as any).appId, (ctx as any).publicId, String(tg.id), styleId)
+        .run();
     }
-  }
 
-  // 2) coins per stamp (cfg.passport.collect_coins), only if stamp is NEW
-  const perStampCoins = Math.max(0, Math.floor(Number(cfg?.passport?.collect_coins || 0)));
-  if (didCollect && perStampCoins > 0) {
     try {
-      await awardCoins(
-        db,
-        (ctx as any).appId,
-        (ctx as any).publicId,
-        String(tg.id),
-        perStampCoins,
-        "passport_stamp_collect",
-        String(styleId),
-        `stamp:${String(styleId)}`,
-        `passport:stamp:${(ctx as any).publicId}:${tg.id}:${passportCampaignId}:${styleId}:${perStampCoins}`
-      );
-    } catch (e3) {
-      console.error("[passport.collect_coins] awardCoins failed", e3);
+      await passportIssueRewardIfCompleted(db, env, ctx, tg.id, cfg);
+    } catch (e) {
+      console.error("[passport.reward] failed", e);
     }
+
+    const fresh = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
+    return json({ ok: true, style_id: styleId, fresh_state: fresh }, 200, request);
   }
 
-  try {
-    await passportIssueRewardIfCompleted(db, env, ctx, tg.id, cfg);
-  } catch (e4) {
-    console.error("[passport.reward] failed", e4);
-  }
-
-  const fresh = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
-  return json(
-    {
-      ok: true,
-      style_id: styleId,
-      collected: didCollect,
-      coins_awarded: didCollect ? perStampCoins : 0,
-      fresh_state: fresh,
-    },
-    200,
-    request
-  );
-}
-
-// ====== pin_use
+  // ====== pin_use
   if (type === "pin_use") {
     const { pin, style_id } = payload || {};
     const res = await useOneTimePin(db, (ctx as any).publicId, tg.id, pin, style_id);
