@@ -308,16 +308,27 @@ async function ledgerHasEvent(db: any, eventId: string): Promise<boolean> {
   }
 }
 
-function buildDraftText(draft: any) {
+// ================== UI builders ==================
+
+async function buildDraftText(db: any, appPublicId: string, draft: any) {
   const cents = Number(draft?.amount_cents || 0);
   const cashbackCoins = Number(draft?.cashbackCoins || 0);
   const redeemCoins = Number(draft?.redeemCoins || 0);
+
+  const customerTgId = String(draft?.customerTgId || "");
+  const balance = customerTgId ? await getUserCoinsFast(db, appPublicId, customerTgId) : 0;
+
+  const amountCoinsMax = Math.floor(cents / 100); // 1 монета = 1 рубль
+  const maxRedeemNow = Math.max(0, Math.min(balance, amountCoinsMax));
+
   return (
     `❓ Записать продажу?\n` +
     `Сумма: <b>${(cents / 100).toFixed(2)}</b>\n` +
     `Кэшбэк к выдаче: <b>${cashbackCoins}</b> монет\n` +
     `Списание монет: <b>${redeemCoins}</b> монет\n` +
-    `Клиент: <code>${String(draft?.customerTgId || "")}</code>`
+    `Баланс клиента: <b>${balance}</b> монет\n` +
+    `Макс. списание сейчас: <b>${maxRedeemNow}</b>\n` +
+    `Клиент: <code>${customerTgId}</code>`
   );
 }
 
@@ -377,7 +388,6 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
     // sale_reenter
     if (data === "sale_reenter") {
-      // чистим draft + режим ввода списания, но pend оставляем
       await kvDel(env, saleDraftKey(appPublicId, cashierTgId));
       await kvDel(env, saleRedeemWaitKey(appPublicId, cashierTgId));
 
@@ -412,7 +422,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       await kvPutJson(env, saleDraftKey(appPublicId, cashierTgId), draft, 600);
       await kvDel(env, saleRedeemWaitKey(appPublicId, cashierTgId));
 
-      await tgSendMessage(env, botToken, String(chatId), buildDraftText(draft), buildDraftKeyboard(), {
+      await tgSendMessage(env, botToken, String(chatId), await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(), {
         appPublicId,
         tgUserId: cashierTgId,
       });
@@ -438,7 +448,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         env,
         botToken,
         String(chatId),
-        `🪙 Введите сколько монет списать (целым числом).\n0 — не списывать.\nМаксимум: <b>${maxRedeem}</b>`,
+        `🪙 Введите сколько монет списать (целым числом).\n0 — не списывать.\nБаланс клиента: <b>${balance}</b>\nМаксимум к списанию по чеку: <b>${maxRedeem}</b>`,
         {},
         { appPublicId, tgUserId: cashierTgId }
       );
@@ -479,7 +489,6 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
         saleId = (ins as any)?.meta?.last_row_id ? String((ins as any).meta.last_row_id) : "";
       } catch (e: any) {
-        // fallback: старая таблица без redeem_coins
         const ins2 = await db
           .prepare(
             `INSERT INTO sales (app_id, app_public_id, customer_tg_id, cashier_tg_id, amount_cents, cashback_coins, token, created_at)
@@ -504,7 +513,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       await kvDel(env, salePendKey(appPublicId, cashierTgId));
       await kvDel(env, saleRedeemWaitKey(appPublicId, cashierTgId));
 
-      // сохранить action на 1 час (как в монолите)
+      // сохранить action на 1 час
       const actionPayload = {
         appPublicId: String(appPublicId),
         saleId,
@@ -551,51 +560,18 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
       if (await ledgerHasEvent(db, eventId)) {
         await tgAnswerCallbackQuery(botToken, cqId, "Уже начислено", false);
-        await tgSendMessage(
-          env,
-          botToken,
-          String(chatId),
-          `ℹ️ Кэшбэк уже начислен ранее.\nSale #${String(act.saleId || saleId)}`,
-          {},
-          { appPublicId, tgUserId: cashierTgId }
-        );
+        await tgSendMessage(env, botToken, String(chatId), `ℹ️ Кэшбэк уже начислен ранее.\nSale #${String(act.saleId || saleId)}`, {}, { appPublicId, tgUserId: cashierTgId });
         return true;
       }
 
       if (act.customerTgId && cashbackCoins > 0) {
-        await awardCoins(
-          db,
-          appId,
-          appPublicId,
-          String(act.customerTgId),
-          cashbackCoins,
-          "sale_cashback_confirmed",
-          String(act.saleId || saleId),
-          `Кэшбэк ${cbp}% за покупку`,
-          eventId
-        );
-
+        await awardCoins(db, appId, appPublicId, String(act.customerTgId), cashbackCoins, "sale_cashback_confirmed", String(act.saleId || saleId), `Кэшбэк ${cbp}% за покупку`, eventId);
         try {
-          await tgSendMessage(
-            env,
-            botToken,
-            String(act.customerTgId),
-            `🎉 Кассир подтвердил кэшбэк!\nНачислено <b>${cashbackCoins}</b> монет ✅`,
-            {},
-            { appPublicId, tgUserId: String(act.customerTgId) }
-          );
+          await tgSendMessage(env, botToken, String(act.customerTgId), `🎉 Кассир подтвердил кэшбэк!\nНачислено <b>${cashbackCoins}</b> монет ✅`, {}, { appPublicId, tgUserId: String(act.customerTgId) });
         } catch (_) {}
       }
 
-      await tgSendMessage(
-        env,
-        botToken,
-        String(chatId),
-        `✅ Кэшбэк подтверждён.\nSale #${String(act.saleId || saleId)}\nКэшбэк: ${cashbackCoins} монет`,
-        {},
-        { appPublicId, tgUserId: cashierTgId }
-      );
-
+      await tgSendMessage(env, botToken, String(chatId), `✅ Кэшбэк подтверждён.\nSale #${String(act.saleId || saleId)}\nКэшбэк: ${cashbackCoins} монет`, {}, { appPublicId, tgUserId: cashierTgId });
       await tgAnswerCallbackQuery(botToken, cqId, "Подтверждено ✅", false);
       return true;
     }
@@ -615,14 +591,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
       if (await ledgerHasEvent(db, cancelEventId)) {
         await tgAnswerCallbackQuery(botToken, cqId, "Уже отменено", false);
-        await tgSendMessage(
-          env,
-          botToken,
-          String(chatId),
-          `ℹ️ Кэшбэк уже был отменён ранее.\nSale #${String(act.saleId || saleId)}`,
-          {},
-          { appPublicId, tgUserId: cashierTgId }
-        );
+        await tgSendMessage(env, botToken, String(chatId), `ℹ️ Кэшбэк уже был отменён ранее.\nSale #${String(act.saleId || saleId)}`, {}, { appPublicId, tgUserId: cashierTgId });
         return true;
       }
 
@@ -631,40 +600,15 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
       if (!wasConfirmed) {
         await tgAnswerCallbackQuery(botToken, cqId, "Ещё не начисляли", false);
-        await tgSendMessage(
-          env,
-          botToken,
-          String(chatId),
-          `ℹ️ Нельзя отменить: кэшбэк ещё не начислялся.\nSale #${String(act.saleId || saleId)}`,
-          {},
-          { appPublicId, tgUserId: cashierTgId }
-        );
+        await tgSendMessage(env, botToken, String(chatId), `ℹ️ Нельзя отменить: кэшбэк ещё не начислялся.\nSale #${String(act.saleId || saleId)}`, {}, { appPublicId, tgUserId: cashierTgId });
         return true;
       }
 
       if (coinsToCancel > 0) {
-        await awardCoins(
-          db,
-          appId,
-          appPublicId,
-          String(act.customerTgId),
-          -Math.abs(coinsToCancel),
-          "sale_cancel",
-          String(act.saleId || saleId),
-          "cancel cashback",
-          cancelEventId
-        );
+        await awardCoins(db, appId, appPublicId, String(act.customerTgId), -Math.abs(coinsToCancel), "sale_cancel", String(act.saleId || saleId), "cancel cashback", cancelEventId);
       }
 
-      await tgSendMessage(
-        env,
-        botToken,
-        String(chatId),
-        `↩️ Кэшбэк отменён. Sale #${String(act.saleId || saleId)}.`,
-        {},
-        { appPublicId, tgUserId: cashierTgId }
-      );
-
+      await tgSendMessage(env, botToken, String(chatId), `↩️ Кэшбэк отменён. Sale #${String(act.saleId || saleId)}.`, {}, { appPublicId, tgUserId: cashierTgId });
       try {
         await tgSendMessage(env, botToken, String(act.customerTgId), `↩️ Кэшбэк по покупке отменён кассиром.`, {}, { appPublicId, tgUserId: String(act.customerTgId) });
       } catch (_) {}
@@ -691,39 +635,19 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
       const eventId = `sale_redeem_confirm:${appPublicId}:${String(act.saleId || saleId)}`;
 
-      // атомарное списание
-      const res = await spendCoinsIfEnoughAtomic(
-        db,
-        appId,
-        appPublicId,
-        String(act.customerTgId),
-        redeemCoins,
-        "sale_redeem_confirm",
-        String(act.saleId || saleId),
-        `Списание монет за покупку (Sale #${String(act.saleId || saleId)})`,
-        eventId
-      );
+      const res = await spendCoinsIfEnoughAtomic(db, appId, appPublicId, String(act.customerTgId), redeemCoins, "sale_redeem_confirm", String(act.saleId || saleId), `Списание монет за покупку (Sale #${String(act.saleId || saleId)})`, eventId);
 
       if (!res.ok) {
         if (res.error === "NOT_ENOUGH_COINS") {
           await tgAnswerCallbackQuery(botToken, cqId, "Не хватает монет", true);
-          await tgSendMessage(
-            env,
-            botToken,
-            String(chatId),
-            `⛔️ Недостаточно монет у клиента.\nНужно: <b>${redeemCoins}</b>\nЕсть: <b>${Number(res.have || 0)}</b>`,
-            {},
-            { appPublicId, tgUserId: cashierTgId }
-          );
+          await tgSendMessage(env, botToken, String(chatId), `⛔️ Недостаточно монет у клиента.\nНужно: <b>${redeemCoins}</b>\nЕсть: <b>${Number(res.have || 0)}</b>`, {}, { appPublicId, tgUserId: cashierTgId });
           return true;
         }
-
         await tgAnswerCallbackQuery(botToken, cqId, "Ошибка списания", true);
         await tgSendMessage(env, botToken, String(chatId), `⛔️ Ошибка БД при списании.`, {}, { appPublicId, tgUserId: cashierTgId });
         return true;
       }
 
-      // отметить в sales (если колонки уже добавлены)
       try {
         await db
           .prepare(
@@ -746,14 +670,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       );
 
       try {
-        await tgSendMessage(
-          env,
-          botToken,
-          String(act.customerTgId),
-          `🪙 Списано <b>${redeemCoins}</b> монет по вашей покупке.\nБаланс: <b>${Number(res.balance || 0)}</b>`,
-          {},
-          { appPublicId, tgUserId: String(act.customerTgId) }
-        );
+        await tgSendMessage(env, botToken, String(act.customerTgId), `🪙 Списано <b>${redeemCoins}</b> монет по вашей покупке.\nБаланс: <b>${Number(res.balance || 0)}</b>`, {}, { appPublicId, tgUserId: String(act.customerTgId) });
       } catch (_) {}
 
       await tgAnswerCallbackQuery(botToken, cqId, res.reused ? "Уже списано" : "Списано ✅", false);
@@ -780,14 +697,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       const wasConfirmed = await ledgerHasEvent(db, confirmEventId);
       if (!wasConfirmed) {
         await tgAnswerCallbackQuery(botToken, cqId, "Ещё не списывали", false);
-        await tgSendMessage(
-          env,
-          botToken,
-          String(chatId),
-          `ℹ️ Нельзя отменить: списание ещё не подтверждалось.\nSale #${String(act.saleId || saleId)}`,
-          {},
-          { appPublicId, tgUserId: cashierTgId }
-        );
+        await tgSendMessage(env, botToken, String(chatId), `ℹ️ Нельзя отменить: списание ещё не подтверждалось.\nSale #${String(act.saleId || saleId)}`, {}, { appPublicId, tgUserId: cashierTgId });
         return true;
       }
 
@@ -797,20 +707,8 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         return true;
       }
 
-      // возврат монет (идемпотентно по cancelEventId)
-      const rr = await awardCoins(
-        db,
-        appId,
-        appPublicId,
-        String(act.customerTgId),
-        Math.abs(redeemCoins),
-        "sale_redeem_cancel",
-        String(act.saleId || saleId),
-        `Возврат монет (отмена списания) Sale #${String(act.saleId || saleId)}`,
-        cancelEventId
-      );
+      const rr: any = await awardCoins(db, appId, appPublicId, String(act.customerTgId), Math.abs(redeemCoins), "sale_redeem_cancel", String(act.saleId || saleId), `Возврат монет (отмена списания) Sale #${String(act.saleId || saleId)}`, cancelEventId);
 
-      // отметить в sales
       try {
         await db
           .prepare(
@@ -823,24 +721,10 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
           .run();
       } catch (_) {}
 
-      await tgSendMessage(
-        env,
-        botToken,
-        String(chatId),
-        `↩️ Списание отменено. Sale #${String(act.saleId || saleId)}.\nВозвращено: <b>${redeemCoins}</b>\nБаланс: <b>${Number((rr as any)?.balance ?? 0)}</b>`,
-        {},
-        { appPublicId, tgUserId: cashierTgId }
-      );
+      await tgSendMessage(env, botToken, String(chatId), `↩️ Списание отменено. Sale #${String(act.saleId || saleId)}.\nВозвращено: <b>${redeemCoins}</b>\nБаланс: <b>${Number(rr?.balance ?? 0)}</b>`, {}, { appPublicId, tgUserId: cashierTgId });
 
       try {
-        await tgSendMessage(
-          env,
-          botToken,
-          String(act.customerTgId),
-          `↩️ Отмена списания: возвращено <b>${redeemCoins}</b> монет.\nБаланс: <b>${Number((rr as any)?.balance ?? 0)}</b>`,
-          {},
-          { appPublicId, tgUserId: String(act.customerTgId) }
-        );
+        await tgSendMessage(env, botToken, String(act.customerTgId), `↩️ Отмена списания: возвращено <b>${redeemCoins}</b> монет.\nБаланс: <b>${Number(rr?.balance ?? 0)}</b>`, {}, { appPublicId, tgUserId: String(act.customerTgId) });
       } catch (_) {}
 
       await tgAnswerCallbackQuery(botToken, cqId, "Отменено ✅", false);
@@ -884,14 +768,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         kb.push(row);
       }
 
-      await tgSendMessage(
-        env,
-        botToken,
-        String(chatId),
-        `Выбери штамп/день — PIN уйдёт клиенту (клиент: ${String(act.customerTgId)})`,
-        { reply_markup: { inline_keyboard: kb } },
-        { appPublicId, tgUserId: cashierTgId }
-      );
+      await tgSendMessage(env, botToken, String(chatId), `Выбери штамп/день — PIN уйдёт клиенту (клиент: ${String(act.customerTgId)})`, { reply_markup: { inline_keyboard: kb } }, { appPublicId, tgUserId: cashierTgId });
 
       await tgAnswerCallbackQuery(botToken, cqId, "Выбери стиль", false);
       return true;
@@ -916,10 +793,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
       let stTitle = "";
       try {
-        const r = await db
-          .prepare(`SELECT title FROM styles_dict WHERE app_public_id=? AND style_id=? LIMIT 1`)
-          .bind(appPublicId, styleId)
-          .first();
+        const r = await db.prepare(`SELECT title FROM styles_dict WHERE app_public_id=? AND style_id=? LIMIT 1`).bind(appPublicId, styleId).first();
         stTitle = r ? String((r as any).title || "") : "";
       } catch (_) {}
 
@@ -929,39 +803,20 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         return true;
       }
 
-      // сохранить контекст PIN (для отмены)
       try {
-        await kvPutJson(
-          env,
-          pinActionKey(appPublicId, String(pinRes.pin), cashierTgId),
-          { appPublicId, pin: String(pinRes.pin), customerTgId: String(act.customerTgId), styleId },
-          3600
-        );
+        await kvPutJson(env, pinActionKey(appPublicId, String(pinRes.pin), cashierTgId), { appPublicId, pin: String(pinRes.pin), customerTgId: String(act.customerTgId), styleId }, 3600);
       } catch (_) {}
 
-      // клиенту
       try {
-        await tgSendMessage(
-          env,
-          botToken,
-          String(act.customerTgId),
-          `🔑 Ваш PIN для отметки штампа${stTitle ? ` “${stTitle}”` : ""}:\n<code>${String(pinRes.pin)}</code>\n\n(одноразовый)`,
-          {},
-          { appPublicId, tgUserId: String(act.customerTgId) }
-        );
+        await tgSendMessage(env, botToken, String(act.customerTgId), `🔑 Ваш PIN для отметки штампа${stTitle ? ` “${stTitle}”` : ""}:\n<code>${String(pinRes.pin)}</code>\n\n(одноразовый)`, {}, { appPublicId, tgUserId: String(act.customerTgId) });
       } catch (_) {}
 
-      // кассиру
       await tgSendMessage(
         env,
         botToken,
         String(chatId),
         `✅ PIN отправлен клиенту ${String(act.customerTgId)} для ${stTitle ? `“${stTitle}”` : styleId}.\nPIN: <code>${String(pinRes.pin)}</code>`,
-        {
-          reply_markup: {
-            inline_keyboard: [[{ text: "⛔️ Отменить PIN", callback_data: `pin_void:${String(pinRes.pin)}` }]],
-          },
-        },
+        { reply_markup: { inline_keyboard: [[{ text: "⛔️ Отменить PIN", callback_data: `pin_void:${String(pinRes.pin)}` }]] } },
         { appPublicId, tgUserId: cashierTgId }
       );
 
@@ -1033,7 +888,6 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       const customerTgId = tokObj && tokObj.customerTgId ? String(tokObj.customerTgId) : "";
       const tokenAppPublicId = tokObj && tokObj.appPublicId ? String(tokObj.appPublicId) : "";
 
-      // токен должен принадлежать этому publicId
       if (tokenAppPublicId && tokenAppPublicId !== appPublicId) {
         await tgSendMessage(env, botToken, chatId, "⛔️ Этот QR относится к другому проекту/боту. Откройте QR в правильном боте.", {}, { appPublicId, tgUserId: fromId });
         return true;
@@ -1046,17 +900,11 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         return true;
       }
 
-      const pend = {
-        appPublicId,
-        customerTgId,
-        token,
-        cashback_percent: ss.cashback_percent,
-      };
+      const pend = { appPublicId, customerTgId, token, cashback_percent: ss.cashback_percent };
 
       await kvPutJson(env, salePendKey(appPublicId, String(fromId)), pend, 600);
-      await kvDel(env, saleTokKey(token)); // одноразовый
+      await kvDel(env, saleTokKey(token));
 
-      // на всякий: чистим старые режимы
       await kvDel(env, saleDraftKey(appPublicId, String(fromId)));
       await kvDel(env, saleRedeemWaitKey(appPublicId, String(fromId)));
 
@@ -1093,7 +941,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       await kvPutJson(env, saleDraftKey(appPublicId, String(fromId)), draft, 600);
       await kvDel(env, saleRedeemWaitKey(appPublicId, String(fromId)));
 
-      await tgSendMessage(env, botToken, chatId, buildDraftText(draft), buildDraftKeyboard(), { appPublicId, tgUserId: fromId });
+      await tgSendMessage(env, botToken, chatId, await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(), { appPublicId, tgUserId: fromId });
       return true;
     }
   } catch (_) {}
@@ -1111,7 +959,6 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       const cbp = Math.max(0, Math.min(100, Number((pend as any)?.cashback_percent ?? 10)));
       const cashbackCoins = Math.max(0, Math.floor((cents / 100) * (cbp / 100)));
 
-      // сохраняем draft (redeemCoins по умолчанию 0)
       const draft = {
         appPublicId,
         customerTgId: String((pend as any).customerTgId || ""),
@@ -1124,7 +971,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
       await kvPutJson(env, saleDraftKey(appPublicId, String(fromId)), draft, 600);
 
-      await tgSendMessage(env, botToken, chatId, buildDraftText(draft), buildDraftKeyboard(), { appPublicId, tgUserId: fromId });
+      await tgSendMessage(env, botToken, chatId, await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(), { appPublicId, tgUserId: fromId });
       return true;
     }
   } catch (_) {}
