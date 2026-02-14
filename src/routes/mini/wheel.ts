@@ -46,10 +46,27 @@ async function getBotTokenForApp(publicId: string, env: Env, appIdFallback: any 
 }
 
 async function pickWheelPrize(db: any, appPublicId: string) {
-  const rows = await db
-    .prepare(`SELECT code, title, weight, coins, active, img FROM wheel_prizes WHERE app_public_id = ?`)
-    .bind(appPublicId)
-    .all();
+  // ⚠️ ВАЖНО: совместимость со старой схемой, где wheel_prizes не имеет img.
+  let rows: any;
+
+  try {
+    rows = await db
+      .prepare(`SELECT code, title, weight, coins, active, img FROM wheel_prizes WHERE app_public_id = ?`)
+      .bind(appPublicId)
+      .all();
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (/no such column:\s*img/i.test(msg)) {
+      rows = await db
+        .prepare(`SELECT code, title, weight, coins, active FROM wheel_prizes WHERE app_public_id = ?`)
+        .bind(appPublicId)
+        .all();
+    } else {
+      throw e;
+    }
+  }
+
+  const hasImg = !!(rows?.results && rows.results.length && Object.prototype.hasOwnProperty.call(rows.results[0], "img"));
 
   const list = (rows.results || [])
     .filter((r: any) => Number(r.active || 0) && Number(r.weight || 0) > 0)
@@ -58,7 +75,7 @@ async function pickWheelPrize(db: any, appPublicId: string) {
       title: String(r.title || r.code),
       weight: Number(r.weight),
       coins: Number(r.coins || 0),
-      img: r.img || "",
+      img: hasImg ? (r as any).img || "" : "",
     }));
 
   if (!list.length) return null;
@@ -66,10 +83,12 @@ async function pickWheelPrize(db: any, appPublicId: string) {
   const sum = list.reduce((a: number, b: any) => a + b.weight, 0);
   let rnd = Math.random() * sum;
   let acc = 0;
+
   for (const it of list) {
     acc += it.weight;
     if (rnd <= acc) return it;
   }
+
   return list[list.length - 1];
 }
 
@@ -84,7 +103,6 @@ type WheelArgs = {
 
   buildState: (db: any, appId: any, appPublicId: string, tgId: any, cfg: any) => Promise<any>;
 
-  // чтобы не дублировать монетную логику:
   spendCoinsIfEnough: (
     db: any,
     appId: any,
@@ -271,7 +289,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
 
     const prizeCoins = Math.max(0, Math.floor(Number(pr?.coins || 0)));
 
-    // B) любой приз -> wheel_redeems + deep link redeem_
+    // любой приз -> wheel_redeems + deep link redeem_
     let redeem: any = await db
       .prepare(
         `SELECT id, redeem_code, status
