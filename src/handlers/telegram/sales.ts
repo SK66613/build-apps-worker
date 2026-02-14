@@ -359,25 +359,14 @@ function buildDraftKeyboard(redeemCoins: number) {
 }
 
 
-function buildAfterRecordKeyboard(saleId: string, redeemCoins: number) {
-  const kb: any[] = [
-    [
-      { text: "✅ Подтвердить кэшбэк", callback_data: `sale_confirm:${saleId}` },
-      { text: "❌ Отменить кэшбэк", callback_data: `sale_cancel:${saleId}` },
-    ],
-  ];
-
-  if (redeemCoins > 0) {
-    kb.push([
-      { text: "🪙 Подтвердить списание", callback_data: `sale_redeem_confirm:${saleId}` },
-      { text: "↩️ Отменить списание", callback_data: `sale_redeem_cancel:${saleId}` },
-    ]);
-  }
-
-  kb.push([{ text: "🔑 Выдать PIN", callback_data: `pin_menu:${saleId}` }]);
-
-  return { reply_markup: { inline_keyboard: kb } };
+function buildAfterRecordKeyboardPinOnly(saleId: string) {
+  return {
+    reply_markup: {
+      inline_keyboard: [[{ text: "🔑 Выдать PIN", callback_data: `pin_menu:${saleId}` }]],
+    },
+  };
 }
+
 
 // ================== MAIN: handleSalesFlow ==================
 
@@ -533,7 +522,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         `Списание монет: ${Number(actionPayload.redeemCoins)} монет\n` +
         `Sale #${saleId}`;
 
-      await tgSendMessage(env, botToken, String(chatId), msgText, buildAfterRecordKeyboard(saleId, redeemCoins), {
+      await tgSendMessage(env, botToken, String(chatId), msgText, buildAfterRecordKeyboardPinOnly(saleId), {
         appPublicId,
         tgUserId: cashierTgId,
       });
@@ -541,6 +530,95 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       await tgAnswerCallbackQuery(botToken, cqId, "Записано ✅", false);
       return true;
     }
+
+    // ===== AUTO: redeem =====
+if (redeemCoins > 0 && saleId) {
+  const ev = `sale_redeem_confirm:${appPublicId}:${saleId}`;
+
+  const r = await spendCoinsIfEnoughAtomic(
+    db,
+    appId,
+    appPublicId,
+    String(actionPayload.customerTgId),
+    redeemCoins,
+    "sale_redeem_auto",
+    String(saleId),
+    `Списание монет за покупку (Sale #${saleId})`,
+    ev
+  );
+
+  if (r.ok) {
+    // отметим sales (если колонки есть)
+    try {
+      await db
+        .prepare(
+          `UPDATE sales
+           SET redeem_status='confirmed',
+               redeem_confirmed_at=datetime('now')
+           WHERE id=? AND app_public_id=?`
+        )
+        .bind(Number(saleId), String(appPublicId))
+        .run();
+    } catch (_) {}
+
+    await tgSendMessage(
+      env,
+      botToken,
+      String(chatId),
+      `✅ Списание подтверждено.\nSale #${saleId}\nСписано: <b>${redeemCoins}</b>\nБаланс клиента: <b>${Number(r.balance || 0)}</b>`,
+      { reply_markup: { inline_keyboard: [[{ text: "↩️ Отменить списание", callback_data: `sale_redeem_cancel:${saleId}` }]] } },
+      { appPublicId, tgUserId: cashierTgId }
+    );
+  } else if (r.error === "NOT_ENOUGH_COINS") {
+    await tgSendMessage(
+      env,
+      botToken,
+      String(chatId),
+      `⛔️ Списание не выполнено: у клиента не хватает монет.\nНужно: <b>${redeemCoins}</b>\nЕсть: <b>${Number(r.have || 0)}</b>\nSale #${saleId}`,
+      {},
+      { appPublicId, tgUserId: cashierTgId }
+    );
+  } else {
+    await tgSendMessage(
+      env,
+      botToken,
+      String(chatId),
+      `⛔️ Ошибка списания монет (Sale #${saleId}).`,
+      {},
+      { appPublicId, tgUserId: cashierTgId }
+    );
+  }
+}
+
+
+    // ===== AUTO: cashback =====
+const cashbackCoins = Math.max(0, Math.floor(Number(actionPayload.cashbackCoins || 0)));
+if (cashbackCoins > 0 && saleId) {
+  const ev = `sale_confirm:${appPublicId}:${saleId}`;
+
+  // awardCoins уже идемпотентный по event_id
+  await awardCoins(
+    db,
+    appId,
+    appPublicId,
+    String(actionPayload.customerTgId),
+    cashbackCoins,
+    "sale_cashback_auto",
+    String(saleId),
+    `Кэшбэк за покупку (Sale #${saleId})`,
+    ev
+  );
+
+  await tgSendMessage(
+    env,
+    botToken,
+    String(chatId),
+    `✅ Кэшбэк подтверждён.\nSale #${saleId}\nКэшбэк: <b>${cashbackCoins}</b> монет`,
+    { reply_markup: { inline_keyboard: [[{ text: "❌ Отменить кэшбэк", callback_data: `sale_cancel:${saleId}` }]] } },
+    { appPublicId, tgUserId: cashierTgId }
+  );
+}
+
 
     // sale_confirm:<id> — подтверждение кэшбэка
     if (data.startsWith("sale_confirm:")) {
