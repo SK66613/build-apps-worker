@@ -527,11 +527,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         tgUserId: cashierTgId,
       });
 
-      await tgAnswerCallbackQuery(botToken, cqId, "Записано ✅", false);
-      return true;
-    }
-
-    // ===== AUTO: redeem =====
+      // ===== AUTO: redeem =====
 if (redeemCoins > 0 && saleId) {
   const ev = `sale_redeem_confirm:${appPublicId}:${saleId}`;
 
@@ -590,8 +586,7 @@ if (redeemCoins > 0 && saleId) {
   }
 }
 
-
-    // ===== AUTO: cashback =====
+      // ===== AUTO: cashback =====
 const cashbackCoins = Math.max(0, Math.floor(Number(actionPayload.cashbackCoins || 0)));
 if (cashbackCoins > 0 && saleId) {
   const ev = `sale_confirm:${appPublicId}:${saleId}`;
@@ -618,6 +613,12 @@ if (cashbackCoins > 0 && saleId) {
     { appPublicId, tgUserId: cashierTgId }
   );
 }
+
+
+      await tgAnswerCallbackQuery(botToken, cqId, "Записано ✅", false);
+      return true;
+    }
+
 
 
     // sale_confirm:<id> — подтверждение кэшбэка
