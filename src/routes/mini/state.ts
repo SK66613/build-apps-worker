@@ -212,8 +212,20 @@ export async function buildState(db: any, appId: any, appPublicId: string, tgId:
   }
 
   const topN = Number(cfg?.LEADERBOARD_TOP_N || 10) || 10;
+try {
   out.leaderboard_today = await buildLeaderboard(db, appPublicId, today, mode, topN);
+} catch (e) {
+  console.warn("[state] leaderboard_today skipped:", (e as any)?.message || e);
+  out.leaderboard_today = [];
+}
+
+try {
   out.leaderboard_alltime = await buildLeaderboardAllTime(db, appPublicId, mode, topN);
+} catch (e) {
+  console.warn("[state] leaderboard_alltime skipped:", (e as any)?.message || e);
+  out.leaderboard_alltime = [];
+}
+
 
   // config snapshot
   const cdH = Number(cfg?.WHEEL_CLAIM_COOLDOWN_H || 24);
