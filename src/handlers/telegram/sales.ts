@@ -172,11 +172,26 @@ async function kvGetJson(env: Env, key: string) {
 }
 async function kvPutJson(env: Env, key: string, obj: any, ttlSec: number) {
   if (!(env as any).BOT_SECRETS) return;
-  await (env as any).BOT_SECRETS.put(key, JSON.stringify(obj ?? {}), { expirationTtl: Number(ttlSec || 600) }).catch(() => {});
+  await (env as any).BOT_SECRETS.put(key, JSON.stringify(obj ?? {}), {
+    expirationTtl: Number(ttlSec || 600),
+  }).catch(() => {});
 }
 async function kvDel(env: Env, key: string) {
   if (!(env as any).BOT_SECRETS) return;
   await (env as any).BOT_SECRETS.delete(key).catch(() => {});
+}
+
+// ================== coins_ledger idempotency helpers ==================
+
+async function ledgerHasEvent(db: any, eventId: string): Promise<boolean> {
+  if (!eventId) return false;
+  try {
+    const r = await db.prepare(`SELECT event_id FROM coins_ledger WHERE event_id=? LIMIT 1`).bind(String(eventId)).first();
+    return !!r;
+  } catch (_) {
+    // если таблицы нет/ошибка — не блокируем (как в монолите), но лучше потом поправить
+    return false;
+  }
 }
 
 // ================== MAIN: handleSalesFlow ==================
@@ -260,6 +275,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         await kvPutJson(env, saleActionKey(actionPayload.appPublicId, saleId, cashierTgId), actionPayload, 3600);
       }
 
+      // ✅ как в оригинале: только "Подтвердить" + "Отменить"
       await tgSendMessage(
         env,
         botToken,
@@ -270,10 +286,9 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
             inline_keyboard: [
               [
                 { text: "✅ Подтвердить кэшбэк", callback_data: `sale_confirm:${saleId}` },
-                { text: "⛔️ Не выдавать", callback_data: `sale_decline:${saleId}` },
+                { text: "❌ Отменить", callback_data: `sale_cancel:${saleId}` },
               ],
               [{ text: "🔑 Выдать PIN", callback_data: `pin_menu:${saleId}` }],
-              [{ text: "↩️ Отменить кэшбэк", callback_data: `sale_cancel:${saleId}` }],
             ],
           },
         },
@@ -298,6 +313,24 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       const cashbackCoins = Math.max(0, Math.floor(Number(act.cashbackCoins || 0)));
       const cbp = Math.max(0, Math.min(100, Number(act.cashback_percent || 0)));
 
+      const eventId = `sale_confirm:${actAppPublicId}:${String(act.saleId || saleId)}`;
+
+      // ✅ защита от повторного нажатия
+      if (await ledgerHasEvent(db, eventId)) {
+        await tgAnswerCallbackQuery(botToken, cqId, "Уже начислено", false);
+
+        await tgSendMessage(
+          env,
+          botToken,
+          String(chatId),
+          `ℹ️ Кэшбэк уже начислен ранее.\nSale #${String(act.saleId || saleId)}`,
+          {},
+          { appPublicId: actAppPublicId, tgUserId: cashierTgId }
+        );
+
+        return true;
+      }
+
       if (act.customerTgId && cashbackCoins > 0) {
         await awardCoins(
           db,
@@ -308,7 +341,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
           "sale_cashback_confirmed",
           String(act.saleId || saleId),
           `Кэшбэк ${cbp}% за покупку`,
-          `sale_confirm:${actAppPublicId}:${String(act.saleId || saleId)}`
+          eventId
         );
 
         try {
@@ -336,43 +369,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       return true;
     }
 
-    // sale_decline:<id>
-    if (data.startsWith("sale_decline:")) {
-      const saleId = data.slice("sale_decline:".length).trim();
-      const act = await kvGetJson(env, saleActionKey(appPublicId, saleId, cashierTgId));
-
-      if (!act || !act.customerTgId) {
-        await tgAnswerCallbackQuery(botToken, cqId, "Контекст продажи не найден (истёк).", true);
-        return true;
-      }
-
-      const actAppPublicId = String(act.appPublicId || appPublicId);
-
-      await tgSendMessage(
-        env,
-        botToken,
-        String(chatId),
-        `⛔️ Кэшбэк НЕ выдан (отменено).\nSale #${String(act.saleId || saleId)}.`,
-        {},
-        { appPublicId: actAppPublicId, tgUserId: cashierTgId }
-      );
-
-      try {
-        await tgSendMessage(
-          env,
-          botToken,
-          String(act.customerTgId),
-          `ℹ️ Кэшбэк по покупке не подтверждён кассиром.`,
-          {},
-          { appPublicId: actAppPublicId, tgUserId: String(act.customerTgId) }
-        );
-      } catch (_) {}
-
-      await tgAnswerCallbackQuery(botToken, cqId, "Ок", false);
-      return true;
-    }
-
-    // sale_cancel:<id>
+    // sale_cancel:<id>  (в оригинале это и есть "отменить")
     if (data.startsWith("sale_cancel:")) {
       const saleId = data.slice("sale_cancel:".length).trim();
       const act = await kvGetJson(env, saleActionKey(appPublicId, saleId, cashierTgId));
@@ -382,17 +379,57 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         return true;
       }
 
-      if (Number(act.cashbackCoins) > 0) {
+      const actAppPublicId = String(act.appPublicId || appPublicId);
+      const cancelEventId = `sale_cancel:${actAppPublicId}:${String(act.saleId || saleId)}`;
+      const coinsToCancel = Math.max(0, Math.floor(Number(act.cashbackCoins || 0)));
+
+      // ✅ защита от повторного нажатия "отменить"
+      if (await ledgerHasEvent(db, cancelEventId)) {
+        await tgAnswerCallbackQuery(botToken, cqId, "Уже отменено", false);
+
+        await tgSendMessage(
+          env,
+          botToken,
+          String(chatId),
+          `ℹ️ Кэшбэк уже был отменён ранее.\nSale #${String(act.saleId || saleId)}`,
+          {},
+          { appPublicId: actAppPublicId, tgUserId: cashierTgId }
+        );
+
+        return true;
+      }
+
+      // ВАЖНО: отмена имеет смысл только если подтверждение уже было.
+      // Иначе не даём уходить в минус по монетам.
+      const confirmEventId = `sale_confirm:${actAppPublicId}:${String(act.saleId || saleId)}`;
+      const wasConfirmed = await ledgerHasEvent(db, confirmEventId);
+
+      if (!wasConfirmed) {
+        await tgAnswerCallbackQuery(botToken, cqId, "Ещё не начисляли", false);
+
+        await tgSendMessage(
+          env,
+          botToken,
+          String(chatId),
+          `ℹ️ Нельзя отменить: кэшбэк ещё не начислялся.\nSale #${String(act.saleId || saleId)}`,
+          {},
+          { appPublicId: actAppPublicId, tgUserId: cashierTgId }
+        );
+
+        return true;
+      }
+
+      if (coinsToCancel > 0) {
         await awardCoins(
           db,
           appId,
-          String(act.appPublicId || appPublicId),
+          actAppPublicId,
           String(act.customerTgId),
-          -Math.abs(Number(act.cashbackCoins)),
+          -Math.abs(coinsToCancel),
           "sale_cancel",
           String(act.saleId || saleId),
           "cancel cashback",
-          `sale_cancel:${String(act.appPublicId || appPublicId)}:${String(act.saleId || saleId)}`
+          cancelEventId
         );
       }
 
@@ -402,7 +439,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         String(chatId),
         `↩️ Кэшбэк отменён. Sale #${String(act.saleId || saleId)}.`,
         {},
-        { appPublicId: String(act.appPublicId || appPublicId), tgUserId: cashierTgId }
+        { appPublicId: actAppPublicId, tgUserId: cashierTgId }
       );
 
       try {
@@ -412,7 +449,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
           String(act.customerTgId),
           `↩️ Кэшбэк по покупке отменён кассиром.`,
           {},
-          { appPublicId: String(act.appPublicId || appPublicId), tgUserId: String(act.customerTgId) }
+          { appPublicId: actAppPublicId, tgUserId: String(act.customerTgId) }
         );
       } catch (_) {}
 
