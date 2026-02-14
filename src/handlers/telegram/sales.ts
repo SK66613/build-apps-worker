@@ -338,23 +338,26 @@ async function buildDraftText(db: any, appPublicId: string, draft: any) {
   );
 }
 
-function buildDraftKeyboard() {
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🪙 Списать монеты", callback_data: "sale_redeem_enter" }],
-        [
-          { text: "✅ Да, записать", callback_data: "sale_record" },
-          { text: "✏️ Ввести заново", callback_data: "sale_reenter" },
-        ],
-        [
-          { text: "🧹 Сбросить списание", callback_data: "sale_redeem_clear" },
-          { text: "⛔️ Отменить", callback_data: "sale_drop" },
-        ],
-      ],
-    },
-  };
+function buildDraftKeyboard(redeemCoins: number) {
+  const rc = Math.max(0, Math.floor(Number(redeemCoins || 0)));
+
+  const kb: any[] = [];
+
+  // ✅ показываем "Списать монеты" только если redeemCoins === 0
+  if (rc === 0) {
+    kb.push([{ text: "🪙 Списать монеты", callback_data: "sale_redeem_enter" }]);
+  }
+
+  kb.push([
+    { text: "✅ Да, записать", callback_data: "sale_record" },
+    { text: "✏️ Ввести заново", callback_data: "sale_reenter" },
+  ]);
+
+  kb.push([{ text: "⛔️ Отменить", callback_data: "sale_drop" }]);
+
+  return { reply_markup: { inline_keyboard: kb } };
 }
+
 
 function buildAfterRecordKeyboard(saleId: string, redeemCoins: number) {
   const kb: any[] = [
@@ -435,7 +438,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       await kvPutJson(env, saleDraftKey(appPublicId, cashierTgId), draft, 600);
       await kvDel(env, saleRedeemWaitKey(appPublicId, cashierTgId));
 
-      await tgSendMessage(env, botToken, String(chatId), await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(), {
+      await tgSendMessage(env, botToken, String(chatId), await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(Number(draft?.redeemCoins || 0)), {
         appPublicId,
         tgUserId: cashierTgId,
       });
@@ -958,7 +961,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       await kvPutJson(env, saleDraftKey(appPublicId, String(fromId)), draft, 600);
       await kvDel(env, saleRedeemWaitKey(appPublicId, String(fromId)));
 
-      await tgSendMessage(env, botToken, chatId, await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(), { appPublicId, tgUserId: fromId });
+      await tgSendMessage(env, botToken, chatId, await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(Number(draft?.redeemCoins || 0)), { appPublicId, tgUserId: fromId });
       return true;
     }
   } catch (_) {}
@@ -988,7 +991,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
 
       await kvPutJson(env, saleDraftKey(appPublicId, String(fromId)), draft, 600);
 
-      await tgSendMessage(env, botToken, chatId, await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(), { appPublicId, tgUserId: fromId });
+      await tgSendMessage(env, botToken, chatId, await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(Number(draft?.redeemCoins || 0)), { appPublicId, tgUserId: fromId });
       return true;
     }
   } catch (_) {}
