@@ -251,25 +251,16 @@ await env.APPS.put(liveKey, JSON.stringify(bp));
     console.error("[sales_settings] sync on publish failed", e);
   }
 
-  // runtime config: use stored or derive from blueprint
-  let runtimeCfg = appObj.app_config ?? appObj.runtime_config ?? null;
-  const looksEmpty =
-    !runtimeCfg ||
-    typeof runtimeCfg !== "object" ||
-    Object.keys(runtimeCfg).length === 0 ||
-    ((runtimeCfg.wheel && Array.isArray(runtimeCfg.wheel.prizes) && runtimeCfg.wheel.prizes.length === 0) &&
-      (runtimeCfg.passport && Array.isArray(runtimeCfg.passport.styles) && runtimeCfg.passport.styles.length === 0));
+  // ✅ runtime config: ALWAYS derive from blueprint on publish (so styles_dict updates)
+  const runtimeCfg = extractRuntimeConfigFromBlueprint(bp || null);
 
-  if (looksEmpty) {
-    runtimeCfg = extractRuntimeConfigFromBlueprint(bp || null);
-
-    appObj.app_config = runtimeCfg;
-    try {
-      await env.APPS.put("app:" + appId, JSON.stringify(appObj));
-    } catch (_) {}
-  }
+  appObj.app_config = runtimeCfg;
+  try {
+    await env.APPS.put("app:" + appId, JSON.stringify(appObj));
+  } catch (_) {}
 
   const syncStats = await syncRuntimeTablesFromConfig(appId, appObj.publicId, runtimeCfg, env);
+
   const publicUrl = "https://mini.salesgenius.ru/m/" + encodeURIComponent(appObj.publicId);
   return json({ ok: true, appId, publicId: appObj.publicId, publicUrl, sync: syncStats }, 200, request);
 }
