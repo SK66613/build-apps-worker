@@ -427,24 +427,7 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
       return true;
     }
 
-    // sale_redeem_clear
-    if (data === "sale_redeem_clear") {
-      const draft = await kvGetJson(env, saleDraftKey(appPublicId, cashierTgId));
-      if (!draft || !draft.customerTgId) {
-        await tgAnswerCallbackQuery(botToken, cqId, "Черновик не найден (истёк).", true);
-        return true;
-      }
-      draft.redeemCoins = 0;
-      await kvPutJson(env, saleDraftKey(appPublicId, cashierTgId), draft, 600);
-      await kvDel(env, saleRedeemWaitKey(appPublicId, cashierTgId));
 
-      await tgSendMessage(env, botToken, String(chatId), await buildDraftText(db, appPublicId, draft), buildDraftKeyboard(Number(draft?.redeemCoins || 0)), {
-        appPublicId,
-        tgUserId: cashierTgId,
-      });
-      await tgAnswerCallbackQuery(botToken, cqId, "Сброшено", false);
-      return true;
-    }
 
     // sale_redeem_enter — перейти в режим ввода монет
     if (data === "sale_redeem_enter") {
