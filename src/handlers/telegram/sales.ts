@@ -360,24 +360,21 @@ function buildDraftKeyboard(redeemCoins: number) {
 
 
 function buildAfterRecordKeyboard(saleId: string, redeemCoins: number) {
+  const rc = Math.max(0, Math.floor(Number(redeemCoins || 0)));
+
   const kb: any[] = [
-    [
-      { text: "✅ Подтвердить кэшбэк", callback_data: `sale_confirm:${saleId}` },
-      { text: "❌ Отменить кэшбэк", callback_data: `sale_cancel:${saleId}` },
-    ],
+    [{ text: "✅ Подтвердить кэшбэк", callback_data: `sale_confirm:${saleId}` }],
   ];
 
-  if (redeemCoins > 0) {
-    kb.push([
-      { text: "🪙 Подтвердить списание", callback_data: `sale_redeem_confirm:${saleId}` },
-      { text: "↩️ Отменить списание", callback_data: `sale_redeem_cancel:${saleId}` },
-    ]);
+  if (rc > 0) {
+    kb.push([{ text: "🪙 Подтвердить списание", callback_data: `sale_redeem_confirm:${saleId}` }]);
   }
 
   kb.push([{ text: "🔑 Выдать PIN", callback_data: `pin_menu:${saleId}` }]);
 
   return { reply_markup: { inline_keyboard: kb } };
 }
+
 
 // ================== MAIN: handleSalesFlow ==================
 
@@ -570,7 +567,19 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
         } catch (_) {}
       }
 
-      await tgSendMessage(env, botToken, String(chatId), `✅ Кэшбэк подтверждён.\nSale #${String(act.saleId || saleId)}\nКэшбэк: ${cashbackCoins} монет`, {}, { appPublicId, tgUserId: cashierTgId });
+      await tgSendMessage(
+  env,
+  botToken,
+  String(chatId),
+  `✅ Кэшбэк подтверждён.\nSale #${String(act.saleId || saleId)}\nКэшбэк: ${cashbackCoins} монет`,
+  {
+    reply_markup: {
+      inline_keyboard: [[{ text: "❌ Отменить кэшбэк", callback_data: `sale_cancel:${String(act.saleId || saleId)}` }]],
+    },
+  },
+  { appPublicId, tgUserId: cashierTgId }
+);
+
       await tgAnswerCallbackQuery(botToken, cqId, "Подтверждено ✅", false);
       return true;
     }
@@ -663,14 +672,19 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
           .run();
       } catch (_) {}
 
-      await tgSendMessage(
-        env,
-        botToken,
-        String(chatId),
-        `✅ Списание подтверждено.\nSale #${String(act.saleId || saleId)}\nСписано: <b>${redeemCoins}</b>\nБаланс клиента: <b>${Number(res.balance || 0)}</b>`,
-        {},
-        { appPublicId, tgUserId: cashierTgId }
-      );
+ await tgSendMessage(
+  env,
+  botToken,
+  String(chatId),
+  `✅ Списание подтверждено.\nSale #${String(act.saleId || saleId)}\nСписано: <b>${redeemCoins}</b>\nБаланс клиента: <b>${Number(res.balance || 0)}</b>`,
+  {
+    reply_markup: {
+      inline_keyboard: [[{ text: "↩️ Отменить списание", callback_data: `sale_redeem_cancel:${String(act.saleId || saleId)}` }]],
+    },
+  },
+  { appPublicId, tgUserId: cashierTgId }
+);
+
 
       try {
         await tgSendMessage(env, botToken, String(act.customerTgId), `🪙 Списано <b>${redeemCoins}</b> монет по вашей покупке.\nБаланс: <b>${Number(res.balance || 0)}</b>`, {}, { appPublicId, tgUserId: String(act.customerTgId) });
