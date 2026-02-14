@@ -1,11 +1,10 @@
 // src/handlers/telegramHandlers.ts
 import type { Env } from "../index";
-import { timingSafeEqual, getBotWebhookSecretForPublicId } from "../services/bots";
+import { getBotWebhookSecretForPublicId, timingSafeEqual } from "../services/bots";
 import { getBotTokenForApp } from "../services/botToken";
 import { resolveAppContextByPublicId } from "../services/apps";
-import { tgSendMessage } from "../services/telegramSend";
 
-import { handleStarsHooks, handleRedeem, handleSalesFlow } from "./telegram"; // из index.ts
+import { handleStarsHooks, handleRedeem, handleSalesFlow } from "./telegram";
 
 function corsHeaders(req: Request) {
   return {
@@ -15,67 +14,82 @@ function corsHeaders(req: Request) {
   };
 }
 
-export async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
-  if (request.method === "OPTIONS") return new Response("OK", { status: 200, headers: corsHeaders(request) });
+/**
+ * ВАЖНО: сигнатура должна остаться как в старом коде,
+ * потому что src/routes/telegram.ts вызывает именно так:
+ * handleTelegramWebhook(publicId, request, env)
+ */
+export async function handleTelegramWebhook(publicId: string, request: Request, env: Env): Promise<Response> {
+  // Telegram должен всегда получить 200
+  const ok = () => new Response("OK", { status: 200, headers: corsHeaders(request) });
 
-  // 1) parse body (Telegram)
-  let upd: any = null;
   try {
-    upd = await request.json();
-  } catch (_) {
-    return new Response("OK", { status: 200, headers: corsHeaders(request) });
-  }
+    if (request.method === "OPTIONS") return ok();
+    if (request.method !== "POST") return ok();
 
-  // 2) public_id из query (как у тебя)
-  const u = new URL(request.url);
-  const publicId = String(u.searchParams.get("public_id") || "");
+    const pid = String(publicId || "").trim();
+    if (!pid) return ok();
 
-  if (!publicId) {
-    // всегда 200 для Telegram
-    return new Response("OK", { status: 200, headers: corsHeaders(request) });
-  }
+    // ===== verify secret (как было у тебя) =====
+    // У тебя в бою URL: /api/tg/webhook/:publicId?s=...
+    // Плюс можно поддержать header secret-token (не мешает).
+    try {
+      const url = new URL(request.url);
+      const gotQuery = String(url.searchParams.get("s") || "");
+      const gotHeader = String(request.headers.get("x-telegram-bot-api-secret-token") || "");
+      const got = gotHeader || gotQuery;
 
-  // 3) verify secret (как у тебя было)
-  try {
-    const got = request.headers.get("x-telegram-bot-api-secret-token") || "";
-    const want = await getBotWebhookSecretForPublicId(env, publicId);
-    if (want && !timingSafeEqual(got, want)) {
-      return new Response("OK", { status: 200, headers: corsHeaders(request) });
+      const want = await getBotWebhookSecretForPublicId(pid, env);
+      if (want && !timingSafeEqual(got, want)) return ok();
+    } catch (_) {
+      return ok();
     }
-  } catch (_) {
-    // безопасно: не роняем
+
+    // ===== parse update =====
+    let upd: any = null;
+    try {
+      upd = await request.json();
+    } catch (_) {
+      return ok();
+    }
+    if (!upd) return ok();
+
+    // ===== resolve ctx =====
+    const ctx = await resolveAppContextByPublicId(pid, env).catch(() => null);
+    if (!ctx || !(ctx as any).appId) return ok();
+
+    const appId = (ctx as any).appId;
+    const canonicalPublicId = String((ctx as any).publicId || pid);
+
+    // ===== bot token =====
+    const botToken = await getBotTokenForApp(canonicalPublicId, env, appId).catch(() => null);
+    if (!botToken) return ok();
+
+    const db: any = env.DB;
+
+    // ===== ROUTING (порядок важен) =====
+
+    // A) Stars hooks (pre_checkout / successful_payment)
+    if (await handleStarsHooks({ env, botToken, publicId: canonicalPublicId, upd })) {
+      return ok();
+    }
+
+    // B) Redeem confirm/decline + /start redeem_
+    if (await handleRedeem({ env, db, ctx: { appId, publicId: canonicalPublicId }, botToken, upd })) {
+      return ok();
+    }
+
+    // C) Sales / pins flow
+    if (await handleSalesFlow({ env, db, ctx: { appId, publicId: canonicalPublicId }, botToken, upd })) {
+      return ok();
+    }
+
+    // D) Остаток “монолита”:
+    // сюда позже вернёшь: паспорт/команды/прочие callback_data.
+    return ok();
+  } catch (e) {
+    // Никаких 500 в телегу
+    console.error("[tg.webhook] UNHANDLED", e);
     return new Response("OK", { status: 200, headers: corsHeaders(request) });
   }
-
-  // 4) resolve ctx
-  const ctx = await resolveAppContextByPublicId(env, publicId).catch(() => null);
-  if (!ctx?.appId) return new Response("OK", { status: 200, headers: corsHeaders(request) });
-
-  // 5) bot token
-  const botToken = await getBotTokenForApp(env, publicId, ctx.appId).catch(() => null);
-  if (!botToken) return new Response("OK", { status: 200, headers: corsHeaders(request) });
-
-  const db = env.DB;
-
-  // ===== ROUTING (важен порядок) =====
-
-  // A) Stars hooks (pre_checkout / successful_payment)
-  const starsRes = await handleStarsHooks({ env, botToken, publicId, upd });
-  if (starsRes) return new Response("OK", { status: 200, headers: corsHeaders(request) });
-
-  // B) Redeem confirm/decline + /start redeem_
-  const redeemed = await handleRedeem({ env, db, ctx: { appId: ctx.appId, publicId }, botToken, upd });
-  if (redeemed) return new Response("OK", { status: 200, headers: corsHeaders(request) });
-
-  // C) Sales / pins flow
-  const sales = await handleSalesFlow({ env, db, ctx: { appId: ctx.appId, publicId }, botToken, upd });
-  if (sales) return new Response("OK", { status: 200, headers: corsHeaders(request) });
-
-  // D) TODO: сюда оставляешь твой “остаток монолита”:
-  // - passport сообщения/команды кассира (если у тебя есть отдельные callback_data)
-  // - /start general
-  // - /profile /help и т.п.
-  // Важно: не ломаем боевую — если не распознали, просто молчим (200).
-
-  return new Response("OK", { status: 200, headers: corsHeaders(request) });
 }
