@@ -141,6 +141,28 @@ async function tgEditMessage(botToken: string, chatId: string, messageId: number
   } catch (_) {}
 }
 
+async function tgSendMessageRaw(botToken: string, chatId: string, text: string, replyMarkup?: any) {
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup ? replyMarkup : undefined,
+      disable_web_page_preview: true,
+    }),
+  });
+  let j: any = null;
+  try { j = await r.json(); } catch (_) {}
+  return j;
+}
+
+
+
+
+
 // ================== settings / coins ==================
 
 async function getSalesSettings(db: any, appPublicId: string) {
@@ -333,9 +355,57 @@ function kb(rows: any[][]) {
   return { reply_markup: { inline_keyboard: rows } };
 }
 
-async function render(env: Env, botToken: string, st: FlowState, text: string, keyboardRows: any[][]) {
-  await tgEditMessage(botToken, st.ui_chat_id, st.ui_message_id, text, kb(keyboardRows).reply_markup);
+async function render(
+  env: Env,
+  botToken: string,
+  st: FlowState,
+  text: string,
+  keyboardRows: any[][]
+) {
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/editMessageText`;
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: st.ui_chat_id,
+        message_id: st.ui_message_id,
+        text,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: keyboardRows }
+      })
+    });
+
+    const j: any = await r.json().catch(()=>null);
+
+    if (!j?.ok) throw new Error("edit failed");
+
+    return;
+  } catch {
+
+    // fallback — создаём новое сообщение
+    const sent: any = await tgSendMessageRaw(
+      botToken,
+      st.ui_chat_id,
+      text,
+      { inline_keyboard: keyboardRows }
+    );
+
+    const newId = sent?.result?.message_id;
+    if (newId) {
+      st.ui_message_id = newId;
+
+      await kvPutJson(
+        env,
+        saleFlowKey(st.customerTgId, st.ui_chat_id),
+        st,
+        3600
+      ).catch(()=>{});
+    }
+  }
 }
+
 
 // Draft text (как ты хотел — с балансом и maxRedeem)
 async function draftText(db: any, appPublicId: string, st: FlowState) {
@@ -1109,17 +1179,21 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
     await kvPutJson(env, salePendKey(appPublicId, String(fromId)), { appPublicId, customerTgId, token, cashback_percent: ss.cashback_percent }, 600);
     await kvDel(env, saleTokKey(token));
 
-    // create one UI message (start of flow)
-    const sent: any = await tgSendMessage(
-      env,
-      botToken,
-      chatId,
-      `✅ Клиент: <code>${customerTgId}</code>\nВведите сумму покупки (например 350 или 350.50):`,
-      kb([[{ text: "⛔️ Отменить", callback_data: "sale_drop" }]]),
-      { appPublicId, tgUserId: fromId }
-    );
+const sent: any = await tgSendMessageRaw(
+  botToken,
+  chatId,
+  `✅ Клиент: <code>${customerTgId}</code>\nВведите сумму покупки (например 350 или 350.50):`,
+  kb([[{ text: "⛔️ Отменить", callback_data: "sale_drop" }]]).reply_markup
+);
 
-    const uiMid = sent?.result?.message_id ? Number(sent.result.message_id) : 0;
+const uiMid = sent?.result?.message_id ? Number(sent.result.message_id) : 0;
+
+if (!uiMid) {
+  // fallback: хотя бы обычное сообщение через твой tgSendMessage
+  await tgSendMessage(env, botToken, chatId, "⛔️ Не смог создать UI-сообщение. Попробуй ещё раз.", {}, { appPublicId, tgUserId: fromId });
+  return true;
+}
+
 
     st = {
       stage: "amount",
