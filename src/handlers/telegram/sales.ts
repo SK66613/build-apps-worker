@@ -177,25 +177,28 @@ async function spendCoinsIfEnoughAtomic(
 
     await db.exec("COMMIT");
     return { ok: true, spent: cost, balance: bal };
-  } catch (e: any) {
+} catch (e: any) {
+  try { await db.exec("ROLLBACK"); } catch (_) {}
+
+  const msg = String(e?.message || e);
+  try {
+    console.log("[sale.redeem.atomic.fail]", JSON.stringify({ appPublicId, tgId: String(tgId), cost, event_id, msg }));
+  } catch (_) {}
+
+  // если стоит UNIQUE(event_id) и прилетел дубль — считаем reused
+  if (/unique|constraint/i.test(msg) && event_id) {
     try {
-      await db.exec("ROLLBACK");
+      const ex: any = await db
+        .prepare(`SELECT balance_after FROM coins_ledger WHERE event_id=? LIMIT 1`)
+        .bind(String(event_id))
+        .first();
+      if (ex) return { ok: true, reused: true, spent: cost, balance: Number(ex.balance_after || 0) };
     } catch (_) {}
-
-    const msg = String(e?.message || e);
-    // если стоит UNIQUE(event_id) и прилетел дубль — считаем reused
-    if (/unique|constraint/i.test(msg) && event_id) {
-      try {
-        const ex: any = await db
-          .prepare(`SELECT balance_after FROM coins_ledger WHERE event_id=? LIMIT 1`)
-          .bind(String(event_id))
-          .first();
-        if (ex) return { ok: true, reused: true, spent: cost, balance: Number(ex.balance_after || 0) };
-      } catch (_) {}
-    }
-
-    return { ok: false, error: "DB_ERROR" };
   }
+
+  return { ok: false, error: "DB_ERROR" };
+}
+
 }
 
 // ================== PINs (MONOLITH COMPAT) ==================
@@ -376,6 +379,13 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
   const { env, db, botToken, upd } = args;
   const appId = args.ctx.appId;
   const appPublicId = String(args.ctx.publicId || ""); // ✅ namespace KV всегда = publicId вебхука
+
+  try {
+  const u = upd?.update_id;
+  const kind = upd?.callback_query ? "callback" : (upd?.message ? "message" : (upd?.edited_message ? "edited" : "other"));
+  console.log("[sales] in", JSON.stringify({ appPublicId, update_id: u, kind }));
+} catch (_) {}
+
 
   // ---------- CALLBACKS ----------
   if (upd?.callback_query?.data) {
@@ -620,6 +630,10 @@ export async function handleSalesFlow(args: SalesArgs): Promise<boolean> {
     // sale_redeem_confirm:<saleId> — подтверждение списания монет
     if (data.startsWith("sale_redeem_confirm:")) {
       const saleId = data.slice("sale_redeem_confirm:".length).trim();
+      try {
+  console.log("[sale.redeem.confirm.click]", JSON.stringify({ appPublicId, saleId, cashierTgId }));
+} catch (_) {}
+
       const act = await kvGetJson(env, saleActionKey(appPublicId, saleId, cashierTgId));
 
       if (!act || !act.customerTgId) {
