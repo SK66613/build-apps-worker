@@ -1,27 +1,14 @@
 // src/routes/mini/state.ts
 import { passportGetIssued } from "./passport";
+import { getLastBalance } from "./coins";
 
 /**
  * Вынесено из src/routes/mini.ts без изменения логики.
- * Экспортируем также утилиты, потому что mini.ts использует nowISO/getLastBalance и т.д.
+ * Теперь баланс берём из coins.ts (ledger -> fallback app_users).
  */
 
 export function nowISO() {
   return new Date().toISOString();
-}
-
-export async function getLastBalance(db: any, appPublicId: string, tgId: any) {
-  const row = await db
-    .prepare(
-      `SELECT balance_after
-       FROM coins_ledger
-       WHERE app_public_id = ? AND tg_id = ?
-       ORDER BY id DESC LIMIT 1`
-    )
-    .bind(String(appPublicId), String(tgId))
-    .first();
-
-  return row ? Number((row as any).balance_after || 0) : 0;
 }
 
 export async function styleTitle(db: any, appPublicId: string, styleId: string) {
@@ -130,15 +117,8 @@ export async function buildState(db: any, appId: any, appPublicId: string, tgId:
     out.bot_username = "";
   }
 
-  // coins
+  // coins (через coins.ts)
   out.coins = await getLastBalance(db, appPublicId, tgId);
-  if (!out.coins) {
-    const u = await db
-      .prepare(`SELECT coins FROM app_users WHERE app_public_id = ? AND tg_user_id = ?`)
-      .bind(appPublicId, String(tgId))
-      .first();
-    out.coins = u ? Number((u as any).coins || 0) : 0;
-  }
 
   // last prizes (10) из bonus_claims
   const lp = await db
