@@ -102,7 +102,9 @@ async function getUserCoinsFast(db: any, appPublicId: string, tgId: string): Pro
   }
 }
 
-// атомарное списание: UPDATE app_users(coins) с условием + INSERT coins_ledger
+
+// атомарное списание без db.exec(): через D1 batch (транзакция)
+// Требование: желательно UNIQUE INDEX на coins_ledger(event_id)
 async function spendCoinsIfEnoughAtomic(
   db: any,
   appId: any,
@@ -113,14 +115,14 @@ async function spendCoinsIfEnoughAtomic(
   ref_id: string,
   note: string,
   event_id: string
-): Promise<{ ok: boolean; spent?: number; balance?: number; reused?: boolean; error?: string; have?: number; need?: number }> {
+): Promise<{ ok: boolean; spent?: number; balance?: number; reused?: boolean; error?: string; have?: number; need?: number; message?: string }> {
   cost = Math.max(0, Math.floor(Number(cost || 0)));
   if (cost <= 0) {
     const bal = await getUserCoinsFast(db, appPublicId, tgId);
     return { ok: true, spent: 0, balance: bal };
   }
 
-  // идемпотентность (быстро)
+  // 0) идемпотентность (быстро)
   if (event_id) {
     try {
       const ex: any = await db
@@ -132,74 +134,75 @@ async function spendCoinsIfEnoughAtomic(
   }
 
   try {
-    // D1/SQLite: BEGIN IMMEDIATE чтобы избежать гонок на coins
-    await db.exec("BEGIN IMMEDIATE");
+    // 1) Транзакция: UPDATE (условно) + INSERT ledger только если UPDATE изменил строку
+    //    Вставка ledger использует changes()>0, чтобы не писать ledger при недостатке монет.
+    const stmts = [
+      db
+        .prepare(
+          `UPDATE app_users
+           SET coins = coins - ?
+           WHERE app_public_id=? AND tg_user_id=? AND coins >= ?`
+        )
+        .bind(cost, String(appPublicId), String(tgId), cost),
 
-    const upd = await db
-      .prepare(
-        `UPDATE app_users
-         SET coins = coins - ?
-         WHERE app_public_id=? AND tg_user_id=? AND coins >= ?`
-      )
-      .bind(cost, String(appPublicId), String(tgId), cost)
-      .run();
+      db
+        .prepare(
+          `INSERT INTO coins_ledger (app_id, app_public_id, tg_id, event_id, src, ref_id, delta, balance_after, note)
+           SELECT ?, ?, ?, ?, ?, ?, ?, 
+                  (SELECT coins FROM app_users WHERE app_public_id=? AND tg_user_id=? LIMIT 1),
+                  ?
+           WHERE changes() > 0`
+        )
+        .bind(
+          String(appId || ""),
+          String(appPublicId),
+          String(tgId),
+          event_id || null,
+          String(src || ""),
+          String(ref_id || ""),
+          -cost,
+          String(appPublicId),
+          String(tgId),
+          String(note || "")
+        ),
+    ];
 
-    const changed = Number((upd as any)?.meta?.changes || 0);
+    const resArr = await db.batch(stmts);
+
+    // результат первого UPDATE
+    const updRes = resArr && resArr[0] ? resArr[0] : null;
+    const changed = Number((updRes as any)?.meta?.changes || 0);
+
     if (!changed) {
       const have = await getUserCoinsFast(db, appPublicId, tgId);
-      await db.exec("ROLLBACK");
       return { ok: false, error: "NOT_ENOUGH_COINS", have, need: cost };
     }
 
-    const row: any = await db
-      .prepare(`SELECT coins FROM app_users WHERE app_public_id=? AND tg_user_id=? LIMIT 1`)
-      .bind(String(appPublicId), String(tgId))
-      .first();
-    const bal = row ? Math.max(0, Math.floor(Number(row.coins || 0))) : 0;
-
-    await db
-      .prepare(
-        `INSERT INTO coins_ledger (app_id, app_public_id, tg_id, event_id, src, ref_id, delta, balance_after, note)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        String(appId || ""),
-        String(appPublicId),
-        String(tgId),
-        event_id || null,
-        String(src || ""),
-        String(ref_id || ""),
-        -cost,
-        bal,
-        String(note || "")
-      )
-      .run();
-
-    await db.exec("COMMIT");
+    // если UPDATE прошёл — берём текущий баланс из app_users (уже после списания)
+    const bal = await getUserCoinsFast(db, appPublicId, tgId);
     return { ok: true, spent: cost, balance: bal };
-} catch (e: any) {
-  try { await db.exec("ROLLBACK"); } catch (_) {}
+  } catch (e: any) {
+    const msg = String(e?.message || e);
 
-  const msg = String(e?.message || e);
-  try {
-    console.log("[sale.redeem.atomic.fail]", JSON.stringify({ appPublicId, tgId: String(tgId), cost, event_id, msg }));
-  } catch (_) {}
+    // если UNIQUE(event_id) сработал — значит списание уже было (транзакция откатилась)
+    if (/unique|constraint/i.test(msg) && event_id) {
+      try {
+        const ex: any = await db
+          .prepare(`SELECT balance_after FROM coins_ledger WHERE event_id=? LIMIT 1`)
+          .bind(String(event_id))
+          .first();
+        if (ex) return { ok: true, reused: true, spent: cost, balance: Number(ex.balance_after || 0) };
+      } catch (_) {}
+    }
 
-  // если стоит UNIQUE(event_id) и прилетел дубль — считаем reused
-  if (/unique|constraint/i.test(msg) && event_id) {
     try {
-      const ex: any = await db
-        .prepare(`SELECT balance_after FROM coins_ledger WHERE event_id=? LIMIT 1`)
-        .bind(String(event_id))
-        .first();
-      if (ex) return { ok: true, reused: true, spent: cost, balance: Number(ex.balance_after || 0) };
+      console.log("[sale.redeem.atomic.fail]", JSON.stringify({ appPublicId, tgId: String(tgId), cost, event_id, msg }));
     } catch (_) {}
+
+    return { ok: false, error: "DB_ERROR", message: msg };
   }
-
-  return { ok: false, error: "DB_ERROR" };
 }
 
-}
 
 // ================== PINs (MONOLITH COMPAT) ==================
 
