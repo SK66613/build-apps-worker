@@ -13,305 +13,403 @@ function escHtml(s: string) {
     .replace(/>/g, "&gt;");
 }
 
-async function tgAnswerCallbackQuery(env: Env, botToken: string, callbackQueryId: string, text?: string) {
-  const url = `https://api.telegram.org/bot${botToken}/answerCallbackQuery`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      callback_query_id: callbackQueryId,
-      text: text || "",
-      show_alert: false,
-    }),
-  }).catch(() => null);
-}
-
-async function notifyUser(env: Env, botToken: string, userTgId: string, txt: string, publicId: string) {
-  if (!userTgId) return;
+async function tgAnswerCallbackQuery(botToken: string, callbackQueryId: string, text = "", showAlert = false) {
   try {
-    await tgSendMessage(
-      env,
-      botToken,
-      String(userTgId),
-      txt,
-      {},
-      { appPublicId: publicId, tgUserId: String(userTgId) }
-    );
+    const url = `https://api.telegram.org/bot${botToken}/answerCallbackQuery`;
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        callback_query_id: callbackQueryId,
+        text: text || "",
+        show_alert: !!showAlert,
+      }),
+    });
   } catch (_) {}
 }
 
-// обработка:
-// - callback_data: redeem_confirm:<CODE> / redeem_decline:<CODE>
-// - /start redeem_<CODE>
+// ===== sales_settings -> cashiers (как в монолите) =====
+async function getSalesSettings(db: any, appPublicId: string) {
+  const row: any = await db
+    .prepare(
+      `SELECT cashier1_tg_id, cashier2_tg_id, cashier3_tg_id, cashier4_tg_id, cashier5_tg_id,
+              cashback_percent, ttl_sec
+       FROM sales_settings
+       WHERE app_public_id = ? LIMIT 1`
+    )
+    .bind(String(appPublicId))
+    .first();
+
+  const cashiers = [
+    row?.cashier1_tg_id,
+    row?.cashier2_tg_id,
+    row?.cashier3_tg_id,
+    row?.cashier4_tg_id,
+    row?.cashier5_tg_id,
+  ]
+    .map((x: any) => (x ? String(x).trim() : ""))
+    .filter(Boolean);
+
+  return { cashiers };
+}
+
+// KV key (как в монолите)
+function redeemActionKey(appPublicId: string, redeemCode: string, cashierTgId: string) {
+  return `redeem_action:${String(appPublicId)}:${String(redeemCode)}:${String(cashierTgId)}`;
+}
+
+async function kvGetJson(env: Env, key: string) {
+  const raw = (env as any).BOT_SECRETS ? await (env as any).BOT_SECRETS.get(key) : null;
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (_) { return null; }
+}
+async function kvPutJson(env: Env, key: string, obj: any, ttlSec: number) {
+  if (!(env as any).BOT_SECRETS) return;
+  await (env as any).BOT_SECRETS.put(key, JSON.stringify(obj ?? {}), { expirationTtl: Number(ttlSec || 3600) }).catch(() => {});
+}
+
 export async function handleRedeem(args: {
   env: Env;
   db: any;
-  ctx: { appId: any; publicId: string };
+  ctx: { appId: any; publicId: string }; // appPublicId
   botToken: string;
   upd: any;
 }): Promise<boolean> {
   const { env, db, ctx, botToken, upd } = args;
+  const appPublicId = String(ctx.publicId || "");
+  const appId = ctx.appId;
 
+  // ================= callback confirm/decline =================
   const cbId = safeStr(upd?.callback_query?.id);
-  const cb = safeStr(upd?.callback_query?.data);
+  const data = safeStr(upd?.callback_query?.data);
   const chatId = String(upd?.callback_query?.message?.chat?.id || upd?.callback_query?.from?.id || "");
   const from = upd?.callback_query?.from;
+  const cashierTgId = String(from?.id || "");
 
-  // ===== callback confirm/decline
-  if (cbId && (cb.startsWith("redeem_confirm:") || cb.startsWith("redeem_decline:"))) {
-    const action = cb.startsWith("redeem_confirm:") ? "confirm" : "decline";
-    const redeemCode = cb.split(":").slice(1).join(":").trim();
-
-    await tgAnswerCallbackQuery(env, botToken, cbId, action === "confirm" ? "Подтверждаю…" : "Отменяю…").catch(() => null);
-
+  if (cbId && (data.startsWith("redeem_confirm:") || data.startsWith("redeem_decline:"))) {
+    const redeemCode = data.split(":").slice(1).join(":").trim();
     if (!redeemCode) {
-      await tgSendMessage(env, botToken, chatId, "❌ Неверный код.", {}, { appPublicId: ctx.publicId, tgUserId: String(from?.id || "") }).catch(() => null);
+      await tgAnswerCallbackQuery(botToken, cbId, "Неверный код", true);
       return true;
     }
 
-    // 1) wheel redeem?
-    const wr: any = await db
-      .prepare(
-        `SELECT id, tg_id, spin_id, prize_code, prize_title, status
+    // cashier check (как в /start в оригинале)
+    const ss = await getSalesSettings(db, appPublicId).catch(() => ({ cashiers: [] }));
+    if (!ss?.cashiers?.includes(String(cashierTgId))) {
+      await tgSendMessage(env, botToken, chatId, "⛔️ Вы не зарегистрированы как кассир для этого проекта.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
+      await tgAnswerCallbackQuery(botToken, cbId, "Нет прав", true);
+      return true;
+    }
+
+    // decline (как в оригинале: просто сообщение)
+    if (data.startsWith("redeem_decline:")) {
+      await tgSendMessage(
+        env,
+        botToken,
+        String(chatId),
+        `⛔️ Выдача отменена.\nКод: <code>${escHtml(redeemCode)}</code>`,
+        {},
+        { appPublicId, tgUserId: cashierTgId }
+      ).catch(() => null);
+
+      await tgAnswerCallbackQuery(botToken, cbId, "Отменено", false);
+      return true;
+    }
+
+    // confirm: act из KV (как в оригинале)
+    const act = await kvGetJson(env, redeemActionKey(appPublicId, redeemCode, cashierTgId));
+    if (!act || !act.redeemCode) {
+      await tgAnswerCallbackQuery(botToken, cbId, "Контекст приза не найден (истёк).", true);
+      return true;
+    }
+
+    // ---------- WHEEL ----------
+    if (act.kind === "wheel") {
+      const r: any = await db.prepare(
+        `SELECT id, tg_id, prize_code, prize_title, status
          FROM wheel_redeems
-         WHERE app_public_id=? AND redeem_code=? LIMIT 1`
-      )
-      .bind(ctx.publicId, redeemCode)
-      .first();
+         WHERE app_public_id=? AND redeem_code=?
+         LIMIT 1`
+      ).bind(appPublicId, redeemCode).first();
 
-    if (wr) {
-      const userTgId = String(wr.tg_id || "");
-
-      if (action === "decline") {
-        await db
-          .prepare(
-            `UPDATE wheel_redeems
-             SET status='declined', declined_at=datetime('now'), declined_by_tg=?
-             WHERE id=? AND status='issued'`
-          )
-          .bind(String(from?.id || ""), Number(wr.id))
-          .run();
-
-        await tgSendMessage(env, botToken, chatId, "🚫 Выдача отменена.", {}, { appPublicId: ctx.publicId, tgUserId: String(from?.id || "") }).catch(() => null);
-
-        // ✅ уведомляем пользователя
-        await notifyUser(
-          env,
-          botToken,
-          userTgId,
-          `🚫 Кассир отменил выдачу приза.\nКод: <code>${escHtml(redeemCode)}</code>`,
-          ctx.publicId
-        );
-
+      if (!r) {
+        await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
+        return true;
+      }
+      if (String(r.status) === "redeemed") {
+        await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
         return true;
       }
 
-      // confirm
-      const updRes = await db
-        .prepare(
-          `UPDATE wheel_redeems
-           SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
-           WHERE id=? AND status='issued'`
-        )
-        .bind(String(from?.id || ""), Number(wr.id))
-        .run();
-
-      if (!updRes?.meta?.changes) {
-        await tgSendMessage(env, botToken, chatId, "ℹ️ Уже обработано или статус не issued.", {}, { appPublicId: ctx.publicId, tgUserId: String(from?.id || "") }).catch(() => null);
-        return true;
-      }
-
-      // начисление монет по wheel_prizes (истина)
+      // coins по wheel_prizes (как в оригинале)
       let coins = 0;
       try {
-        const pr: any = await db
-          .prepare(`SELECT coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`)
-          .bind(ctx.publicId, String(wr.prize_code || ""))
-          .first();
+        const pr: any = await db.prepare(
+          `SELECT coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`
+        ).bind(appPublicId, String(r.prize_code || "")).first();
         coins = Math.max(0, Math.floor(Number(pr?.coins || 0)));
-      } catch (_) {
-        coins = 0;
-      }
+      } catch (_) {}
 
       if (coins > 0) {
         await awardCoins(
           db,
-          ctx.appId,
-          ctx.publicId,
-          String(wr.tg_id),
+          appId,
+          appPublicId,
+          String(r.tg_id),
           coins,
-          "wheel_redeem_confirm",
-          String(wr.prize_code || ""),
-          String(wr.prize_title || ""),
-          `wheel:redeem:${ctx.publicId}:${wr.tg_id}:${wr.spin_id}:${redeemCode}:${coins}`
+          "wheel_redeem_confirmed",
+          String(redeemCode),
+          String(r.prize_title || "Wheel prize"),
+          `wheel:redeem:${appPublicId}:${String(r.tg_id)}:${String(r.id)}:${coins}`
         );
       }
 
-      // wheel_spins -> redeemed
-      await db
-        .prepare(
-          `UPDATE wheel_spins
-           SET status='redeemed', ts_redeemed=datetime('now')
-           WHERE app_public_id=? AND id=?`
-        )
-        .bind(ctx.publicId, Number(wr.spin_id))
-        .run()
-        .catch(() => null);
+      await db.prepare(
+        `UPDATE wheel_redeems
+         SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
+         WHERE id=? AND status='issued'`
+      ).bind(String(cashierTgId), Number(r.id)).run();
 
-      // ✅ сообщение кассиру
+      // как в оригинале: wheel_spins по redeem_id (если у тебя так)
+      try{
+        await db.prepare(
+          `UPDATE wheel_spins
+           SET status='redeemed', ts_redeemed=datetime('now'), redeemed_by_tg=?
+           WHERE app_public_id=? AND redeem_id=?`
+        ).bind(String(cashierTgId), appPublicId, Number(r.id)).run();
+      } catch (_) {}
+
       await tgSendMessage(
         env,
         botToken,
-        chatId,
-        `✅ Подтверждено.\n${coins > 0 ? `🪙 Начислено монет: <b>${coins}</b>` : ""}`,
+        String(chatId),
+        `✅ Выдача подтверждена.\nКод: <code>${escHtml(redeemCode)}</code>\nПриз: <b>${escHtml(String(r.prize_title || ""))}</b>` +
+          (coins > 0 ? `\n🪙 Начислено: <b>${coins}</b>` : ""),
         {},
-        { appPublicId: ctx.publicId, tgUserId: String(from?.id || "") }
+        { appPublicId, tgUserId: cashierTgId }
       ).catch(() => null);
 
-      // ✅ сообщение пользователю (ЭТО И БЫЛО ПОТЕРЯНО)
-      await notifyUser(
-        env,
-        botToken,
-        userTgId,
-        `✅ Кассир подтвердил выдачу приза.\n🎁 Приз: <b>${escHtml(String(wr.prize_title || wr.prize_code || ""))}</b>\n` +
-          (coins > 0 ? `🪙 Начислено монет: <b>${coins}</b>` : ""),
-        ctx.publicId
-      );
+      try {
+        await tgSendMessage(
+          env,
+          botToken,
+          String(r.tg_id),
+          `🎉 Кассир подтвердил выдачу!\n<b>${escHtml(String(r.prize_title || ""))}</b>` +
+            (coins > 0 ? `\n🪙 Начислено <b>${coins}</b> монет.` : ""),
+          {},
+          { appPublicId, tgUserId: String(r.tg_id) }
+        );
+      } catch (_) {}
 
+      await tgAnswerCallbackQuery(botToken, cbId, "Подтверждено ✅", false);
       return true;
     }
 
-    // 2) passport reward?
-    const prw: any = await db
-      .prepare(
+    // ---------- PASSPORT ----------
+    if (act.kind === "passport") {
+      const pr: any = await db.prepare(
         `SELECT id, tg_id, prize_code, prize_title, coins, status
          FROM passport_rewards
-         WHERE app_public_id=? AND redeem_code=? LIMIT 1`
-      )
-      .bind(ctx.publicId, redeemCode)
-      .first();
+         WHERE app_public_id=? AND redeem_code=?
+         ORDER BY id DESC
+         LIMIT 1`
+      ).bind(appPublicId, redeemCode).first();
 
-    if (!prw) {
-      await tgSendMessage(env, botToken, chatId, "❌ Код не найден.", {}, { appPublicId: ctx.publicId, tgUserId: String(from?.id || "") }).catch(() => null);
-      return true;
-    }
+      if (!pr) {
+        await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
+        return true;
+      }
+      if (String(pr.status) === "redeemed") {
+        await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
+        return true;
+      }
 
-    const userTgId = String(prw.tg_id || "");
+      const updRes = await db.prepare(
+        `UPDATE passport_rewards
+         SET status='redeemed',
+             redeemed_at=datetime('now'),
+             redeemed_by_tg=?
+         WHERE id=? AND status='issued'`
+      ).bind(String(cashierTgId), Number(pr.id)).run();
 
-    if (action === "decline") {
-      await db
-        .prepare(
-          `UPDATE passport_rewards
-           SET status='declined', declined_at=datetime('now'), declined_by_tg=?
-           WHERE id=? AND status='issued'`
-        )
-        .bind(String(from?.id || ""), Number(prw.id))
-        .run();
+      if (!updRes || !(updRes as any).meta || !(updRes as any).meta.changes) {
+        await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
+        return true;
+      }
 
-      await tgSendMessage(env, botToken, chatId, "🚫 Выдача отменена.", {}, { appPublicId: ctx.publicId, tgUserId: String(from?.id || "") }).catch(() => null);
+      const coins = Math.max(0, Math.floor(Number(pr.coins || 0)));
+      if (coins > 0) {
+        await awardCoins(
+          db,
+          appId,
+          appPublicId,
+          String(pr.tg_id),
+          coins,
+          "passport_complete_redeemed",
+          String(pr.prize_code || ""),
+          String(pr.prize_title || "Паспорт: приз"),
+          `passport:redeem:${appPublicId}:${String(pr.tg_id)}:${String(pr.id)}:${coins}`
+        );
+      }
 
-      // ✅ уведомляем пользователя
-      await notifyUser(
+      // как в оригинале: сброс круга паспорта
+      try {
+        await db.prepare(`DELETE FROM styles_user WHERE app_public_id=? AND tg_id=?`)
+          .bind(appPublicId, String(pr.tg_id))
+          .run();
+      } catch (_) {}
+
+      // как в оригинале: если есть passport_bonus — тоже помечаем
+      try {
+        await db.prepare(
+          `UPDATE passport_bonus
+           SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
+           WHERE app_public_id=? AND redeem_code=? AND status='issued'`
+        ).bind(String(cashierTgId), appPublicId, redeemCode).run();
+      } catch (_) {}
+
+      await tgSendMessage(
         env,
         botToken,
-        userTgId,
-        `🚫 Кассир отменил выдачу приза паспорта.\nКод: <code>${escHtml(redeemCode)}</code>`,
-        ctx.publicId
-      );
+        String(chatId),
+        `✅ Выдача подтверждена.\nКод: <code>${escHtml(redeemCode)}</code>\nПриз: <b>${escHtml(String(pr.prize_title || ""))}</b>` +
+          (coins > 0 ? `\n🪙 Начислено: <b>${coins}</b>` : ""),
+        {},
+        { appPublicId, tgUserId: cashierTgId }
+      ).catch(() => null);
 
+      try {
+        await tgSendMessage(
+          env,
+          botToken,
+          String(pr.tg_id),
+          `🎉 Кассир подтвердил выдачу!\n<b>${escHtml(String(pr.prize_title || ""))}</b>` +
+            (coins > 0 ? `\n🪙 Начислено <b>${coins}</b> монет.` : ""),
+          {},
+          { appPublicId, tgUserId: String(pr.tg_id) }
+        );
+      } catch (_) {}
+
+      await tgAnswerCallbackQuery(botToken, cbId, "Подтверждено ✅", false);
       return true;
     }
 
-    // confirm passport
-    const upd2 = await db
-      .prepare(
-        `UPDATE passport_rewards
-         SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
-         WHERE id=? AND status='issued'`
-      )
-      .bind(String(from?.id || ""), Number(prw.id))
-      .run();
-
-    if (!upd2?.meta?.changes) {
-      await tgSendMessage(env, botToken, chatId, "ℹ️ Уже обработано или статус не issued.", {}, { appPublicId: ctx.publicId, tgUserId: String(from?.id || "") }).catch(() => null);
-      return true;
-    }
-
-    const coins = Math.max(0, Math.floor(Number(prw.coins || 0)));
-    if (coins > 0) {
-      await awardCoins(
-        db,
-        ctx.appId,
-        ctx.publicId,
-        String(prw.tg_id),
-        coins,
-        "passport_redeem_confirm",
-        String(prw.prize_code || ""),
-        String(prw.prize_title || ""),
-        `passport:redeem:${ctx.publicId}:${prw.tg_id}:${redeemCode}:${coins}`
-      );
-    }
-
-    // совместимость: если есть passport_bonus — тоже помечаем redeemed
-    await db
-      .prepare(
-        `UPDATE passport_bonus
-         SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
-         WHERE app_public_id=? AND tg_id=? AND redeem_code=? AND status='issued'`
-      )
-      .bind(String(from?.id || ""), ctx.publicId, String(prw.tg_id), redeemCode)
-      .run()
-      .catch(() => null);
-
-    // ✅ кассиру
-    await tgSendMessage(
-      env,
-      botToken,
-      chatId,
-      `✅ Подтверждено.\n🎁 Приз: <b>${escHtml(String(prw.prize_title || prw.prize_code || ""))}</b>\n${coins > 0 ? `🪙 Начислено монет: <b>${coins}</b>` : ""}`,
-      {},
-      { appPublicId: ctx.publicId, tgUserId: String(from?.id || "") }
-    ).catch(() => null);
-
-    // ✅ пользователю (ЭТО И БЫЛО ПОТЕРЯНО)
-    await notifyUser(
-      env,
-      botToken,
-      userTgId,
-      `✅ Кассир подтвердил выдачу приза паспорта.\n🎁 Приз: <b>${escHtml(String(prw.prize_title || prw.prize_code || ""))}</b>\n` +
-        (coins > 0 ? `🪙 Начислено монет: <b>${coins}</b>` : ""),
-      ctx.publicId
-    );
-
+    await tgAnswerCallbackQuery(botToken, cbId, "Неизвестный тип приза", true);
     return true;
   }
 
-  // ===== /start redeem_CODE (кассир/админ нажал deep-link)
+  // ================= /start redeem_<CODE> =================
   const text = safeStr(upd?.message?.text || "");
   const msgChatId = String(upd?.message?.chat?.id || upd?.message?.from?.id || "");
   const from2 = upd?.message?.from;
+  const from2Id = String(from2?.id || "");
 
   if (text.startsWith("/start") && text.includes("redeem_")) {
     const m = text.match(/redeem_([A-Z0-9\-]+)/i);
     const redeemCode = m ? String(m[1]) : "";
     if (!redeemCode) return false;
 
-    const buttons = {
-      inline_keyboard: [
-        [
-          { text: "✅ Подтвердить", callback_data: `redeem_confirm:${redeemCode}` },
-          { text: "❌ Отменить", callback_data: `redeem_decline:${redeemCode}` },
-        ],
-      ],
-    };
+    // cashier check (как в оригинале)
+    const ss = await getSalesSettings(db, appPublicId).catch(() => ({ cashiers: [] }));
+    const isCashier = ss.cashiers.includes(String(from2Id));
+    if (!isCashier) {
+      await tgSendMessage(env, botToken, msgChatId, "⛔️ Вы не зарегистрированы как кассир для этого проекта.", {}, { appPublicId, tgUserId: from2Id }).catch(() => null);
+      return true;
+    }
+
+    // определяем kind как в оригинале: сначала wheel_redeems, иначе passport_rewards
+    const r: any = await db.prepare(
+      `SELECT id, tg_id, prize_code, prize_title, status
+       FROM wheel_redeems
+       WHERE app_public_id = ? AND redeem_code = ?
+       LIMIT 1`
+    ).bind(appPublicId, redeemCode).first();
+
+    if (!r) {
+      const pr: any = await db.prepare(
+        `SELECT id, tg_id, prize_code, prize_title, coins, status
+         FROM passport_rewards
+         WHERE app_public_id = ? AND redeem_code = ?
+         ORDER BY id DESC
+         LIMIT 1`
+      ).bind(appPublicId, redeemCode).first();
+
+      if (!pr) {
+        await tgSendMessage(env, botToken, msgChatId, "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: from2Id }).catch(() => null);
+        return true;
+      }
+      if (String(pr.status) === "redeemed") {
+        await tgSendMessage(env, botToken, msgChatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from2Id }).catch(() => null);
+        return true;
+      }
+
+      // KV act (passport)
+      await kvPutJson(
+        env,
+        redeemActionKey(appPublicId, redeemCode, String(from2Id)),
+        { kind: "passport", redeemCode },
+        3600
+      );
+
+      const coins = Math.max(0, Math.floor(Number(pr.coins || 0)));
+
+      await tgSendMessage(
+        env,
+        botToken,
+        msgChatId,
+        `❓ Подтвердить выдачу приза по паспорту?\nКод: <code>${escHtml(redeemCode)}</code>\nПриз: <b>${escHtml(String(pr.prize_title || ""))}</b>` +
+          (coins > 0 ? `\n🪙 Монеты: <b>${coins}</b>` : ""),
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "✅ Да, выдать", callback_data: `redeem_confirm:${redeemCode}` },
+              { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` },
+            ]],
+          },
+        },
+        { appPublicId, tgUserId: from2Id }
+      ).catch(() => null);
+
+      return true;
+    }
+
+    // wheel
+    if (String(r.status) === "redeemed") {
+      await tgSendMessage(env, botToken, msgChatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from2Id }).catch(() => null);
+      return true;
+    }
+
+    let coins = 0;
+    try {
+      const pr2: any = await db.prepare(
+        `SELECT coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`
+      ).bind(appPublicId, String(r.prize_code || "")).first();
+      coins = Math.max(0, Math.floor(Number(pr2?.coins || 0)));
+    } catch (_) {}
+
+    // KV act (wheel)
+    await kvPutJson(
+      env,
+      redeemActionKey(appPublicId, redeemCode, String(from2Id)),
+      { kind: "wheel", redeemCode },
+      3600
+    );
 
     await tgSendMessage(
       env,
       botToken,
       msgChatId,
-      `🔐 Код выдачи: <code>${escHtml(redeemCode)}</code>\n\nПодтверди или отмени выдачу:`,
-      { reply_markup: buttons },
-      { appPublicId: ctx.publicId, tgUserId: String(from2?.id || "") }
+      `❓ Подтвердить выдачу приза?\nКод: <code>${escHtml(redeemCode)}</code>\nПриз: <b>${escHtml(String(r.prize_title || ""))}</b>` +
+        (coins > 0 ? `\n🪙 Монеты: <b>${coins}</b>` : ""),
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ Да, выдать", callback_data: `redeem_confirm:${redeemCode}` },
+            { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` },
+          ]],
+        },
+      },
+      { appPublicId, tgUserId: from2Id }
     ).catch(() => null);
 
     return true;
