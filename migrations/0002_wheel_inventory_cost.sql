@@ -42,3 +42,4 @@ CREATE INDEX IF NOT EXISTS idx_wheel_redeems_app_status_issued_at
 
 CREATE INDEX IF NOT EXISTS idx_wheel_redeems_app_tg_issued_at
   ON wheel_redeems(app_public_id, tg_id, issued_at);
+
