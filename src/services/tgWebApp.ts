@@ -1,6 +1,15 @@
 // src/services/tgWebApp.ts
 // Verify Telegram WebApp initData signature (HMAC SHA-256).
 
+function safeHexEqual(a: string, b: string): boolean {
+  const aa = String(a || "").toLowerCase();
+  const bb = String(b || "").toLowerCase();
+  if (aa.length !== bb.length) return false;
+
+  let diff = 0;
+  for (let i = 0; i < aa.length; i++) diff |= aa.charCodeAt(i) ^ bb.charCodeAt(i);
+  return diff === 0;
+}
 
 export async function verifyInitDataSignature(initData: string, botToken: string) {
   if (!initData || !botToken) return false;
@@ -43,5 +52,5 @@ export async function verifyInitDataSignature(initData: string, botToken: string
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 
-  return calcHash === hash.toLowerCase();
+  return safeHexEqual(calcHash, hash);
 }
