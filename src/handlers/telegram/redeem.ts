@@ -3,6 +3,19 @@ import type { Env } from "../../index";
 import { tgSendMessage } from "../../services/telegramSend";
 import { awardCoins } from "../../services/coinsLedger";
 
+function logRedeemEvent(event: {
+  code: string;
+  msg: string;
+  appPublicId: string;
+  tgUserId: string;
+  route: string;
+  extra?: Record<string, any>;
+}) {
+  try {
+    console.log(JSON.stringify(event));
+  } catch (_) {}
+}
+
 function safeStr(v: any) {
   return String(v ?? "").trim();
 }
@@ -87,8 +100,16 @@ export async function handleRedeem(args: {
   const cashierTgId = String(from?.id || "");
 
   if (cbId && (data.startsWith("redeem_confirm:") || data.startsWith("redeem_decline:"))) {
+    const route = "wheel.cashier.confirm";
     const redeemCode = data.split(":").slice(1).join(":").trim();
     if (!redeemCode) {
+      logRedeemEvent({
+        code: "mini.wheel.cashier.confirm.fail.reward_not_found",
+        msg: "Empty redeem code",
+        appPublicId,
+        tgUserId: cashierTgId,
+        route,
+      });
       await tgAnswerCallbackQuery(botToken, cbId, "Неверный код", true);
       return true;
     }
@@ -96,6 +117,13 @@ export async function handleRedeem(args: {
     // cashier check (как в /start в оригинале)
     const ss = await getSalesSettings(db, appPublicId).catch(() => ({ cashiers: [] }));
     if (!ss?.cashiers?.includes(String(cashierTgId))) {
+      logRedeemEvent({
+        code: "mini.wheel.cashier.confirm.fail.unauthorized",
+        msg: "Cashier is not authorized",
+        appPublicId,
+        tgUserId: cashierTgId,
+        route,
+      });
       await tgSendMessage(env, botToken, chatId, "⛔️ Вы не зарегистрированы как кассир для этого проекта.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
       await tgAnswerCallbackQuery(botToken, cbId, "Нет прав", true);
       return true;
@@ -119,24 +147,62 @@ export async function handleRedeem(args: {
     // confirm: act из KV (как в оригинале)
     const act = await kvGetJson(env, redeemActionKey(appPublicId, redeemCode, cashierTgId));
     if (!act || !act.redeemCode) {
+      logRedeemEvent({
+        code: "mini.wheel.cashier.confirm.fail.reward_not_found",
+        msg: "Redeem action context is missing",
+        appPublicId,
+        tgUserId: cashierTgId,
+        route,
+        extra: { redeemCode },
+      });
       await tgAnswerCallbackQuery(botToken, cbId, "Контекст приза не найден (истёк).", true);
       return true;
     }
 
     // ---------- WHEEL ----------
     if (act.kind === "wheel") {
-      const r: any = await db.prepare(
-        `SELECT id, tg_id, prize_code, prize_title, status
-         FROM wheel_redeems
-         WHERE app_public_id=? AND redeem_code=?
-         LIMIT 1`
-      ).bind(appPublicId, redeemCode).first();
+      let r: any;
+      try {
+        r = await db.prepare(
+          `SELECT id, tg_id, prize_code, prize_title, status
+           FROM wheel_redeems
+           WHERE app_public_id=? AND redeem_code=?
+           LIMIT 1`
+        ).bind(appPublicId, redeemCode).first();
+      } catch (e: any) {
+        logRedeemEvent({
+          code: "mini.wheel.cashier.confirm.fail.db_error",
+          msg: "Failed to fetch wheel reward",
+          appPublicId,
+          tgUserId: cashierTgId,
+          route,
+          extra: { redeemCode, error: String(e?.message || e) },
+        });
+        await tgSendMessage(env, botToken, String(chatId), "⛔️ Ошибка БД, попробуйте ещё раз.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
+        return true;
+      }
 
       if (!r) {
+        logRedeemEvent({
+          code: "mini.wheel.cashier.confirm.fail.reward_not_found",
+          msg: "Reward not found by redeem_code",
+          appPublicId,
+          tgUserId: cashierTgId,
+          route,
+          extra: { redeemCode },
+        });
         await tgSendMessage(env, botToken, String(chatId), "⛔️ Код недействителен или приз не найден.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
         return true;
       }
       if (String(r.status) === "redeemed") {
+        logRedeemEvent({
+          code: "mini.wheel.cashier.confirm.fail.reward_not_found",
+          msg: "Reward already redeemed",
+          appPublicId,
+          tgUserId: cashierTgId,
+          route,
+          extra: { redeemCode, rewardId: Number(r.id) },
+        });
         await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
         return true;
       }
@@ -149,6 +215,39 @@ export async function handleRedeem(args: {
         ).bind(appPublicId, String(r.prize_code || "")).first();
         coins = Math.max(0, Math.floor(Number(pr?.coins || 0)));
       } catch (_) {}
+
+      let updRes: any;
+      try {
+        updRes = await db.prepare(
+          `UPDATE wheel_redeems
+           SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
+           WHERE id=? AND status='issued'`
+        ).bind(String(cashierTgId), Number(r.id)).run();
+      } catch (e: any) {
+        logRedeemEvent({
+          code: "mini.wheel.cashier.confirm.fail.db_error",
+          msg: "Failed to update wheel reward",
+          appPublicId,
+          tgUserId: cashierTgId,
+          route,
+          extra: { redeemCode, rewardId: Number(r.id), error: String(e?.message || e) },
+        });
+        await tgSendMessage(env, botToken, String(chatId), "⛔️ Ошибка БД, попробуйте ещё раз.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
+        return true;
+      }
+
+      if (!updRes || !(updRes as any).meta || !(updRes as any).meta.changes) {
+        logRedeemEvent({
+          code: "mini.wheel.cashier.confirm.fail.reward_not_found",
+          msg: "Reward status is not issued",
+          appPublicId,
+          tgUserId: cashierTgId,
+          route,
+          extra: { redeemCode, rewardId: Number(r.id) },
+        });
+        await tgSendMessage(env, botToken, String(chatId), "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: cashierTgId }).catch(() => null);
+        return true;
+      }
 
       if (coins > 0) {
         await awardCoins(
@@ -163,12 +262,6 @@ export async function handleRedeem(args: {
           `wheel:redeem:${appPublicId}:${String(r.tg_id)}:${String(r.id)}:${coins}`
         );
       }
-
-      await db.prepare(
-        `UPDATE wheel_redeems
-         SET status='redeemed', redeemed_at=datetime('now'), redeemed_by_tg=?
-         WHERE id=? AND status='issued'`
-      ).bind(String(cashierTgId), Number(r.id)).run();
 
       // как в оригинале: wheel_spins по redeem_id (если у тебя так)
       try{
@@ -200,6 +293,15 @@ export async function handleRedeem(args: {
           { appPublicId, tgUserId: String(r.tg_id) }
         );
       } catch (_) {}
+
+      logRedeemEvent({
+        code: "mini.wheel.cashier.confirm.ok",
+        msg: "Cashier confirmed wheel reward",
+        appPublicId,
+        tgUserId: cashierTgId,
+        route,
+        extra: { redeemCode, rewardId: Number(r.id), coins },
+      });
 
       await tgAnswerCallbackQuery(botToken, cbId, "Подтверждено ✅", false);
       return true;
@@ -317,13 +419,7 @@ export async function handleRedeem(args: {
       return true;
     }
 
-    // определяем kind как в оригинале: сначала wheel_redeems, иначе passport_rewards
-    const r: any = await db.prepare(
-      `SELECT id, tg_id, prize_code, prize_title, status
-       FROM wheel_redeems
-       WHERE app_public_id = ? AND redeem_code = ?
-       LIMIT 1`
-    ).bind(appPublicId, redeemCode).first();
+
 
     if (!r) {
       const pr: any = await db.prepare(
