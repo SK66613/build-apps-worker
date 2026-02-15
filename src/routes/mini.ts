@@ -307,20 +307,39 @@ const initDataRaw =
   url.searchParams.get("initData") ||
   null;
 
-  const tg = (body.tg_user && body.tg_user.id ? body.tg_user : parseInitDataUser(String(initDataRaw || ""))) || {};
-  if (!tg || !tg.id) {
-    if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
-      logMiniWheelEvent({
-        code: "mini.wheel.spin.fail.invalid_initdata",
-        msg: "Missing tg user in request",
-        appPublicId: String(publicId || ""),
-        tgUserId: "",
-        route: "wheel.spin",
-      });
-      
-    }
-    return json({ ok: false, error: "NO_TG_USER_ID" }, 400, request);
+const tg =
+  (body.tg_user && body.tg_user.id
+    ? body.tg_user
+    : parseInitDataUser(String(initDataRaw || ""))) || {};
+
+if (!tg || !tg.id) {
+  // ✅ диагностируем ВСЕ mini-роуты, не только spin
+  try {
+    console.log(JSON.stringify({
+      code: "mini.auth.fail.no_tg_user",
+      type,
+      publicId: String(publicId || ""),
+      hasInitData: !!initDataRaw,
+      initDataLen: String(initDataRaw || "").length,
+      hasTgUserInBody: !!(body?.tg_user && body.tg_user.id),
+      bodyKeys: Object.keys(body || {}).slice(0, 40),
+    }));
+  } catch (_) {}
+
+  // твой спец-лог для колеса (оставляем как было)
+  if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
+    logMiniWheelEvent({
+      code: "mini.wheel.spin.fail.invalid_initdata",
+      msg: "Missing tg user in request",
+      appPublicId: String(publicId || ""),
+      tgUserId: "",
+      route: "wheel.spin",
+    });
   }
+
+  return json({ ok: false, error: "NO_TG_USER_ID" }, 400, request);
+}
+
 
   const ctx = await requireTgAndVerify(publicId, initDataRaw, env);
   if (!(ctx as any).ok) {
