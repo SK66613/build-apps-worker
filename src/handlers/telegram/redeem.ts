@@ -419,13 +419,7 @@ export async function handleRedeem(args: {
       return true;
     }
 
-    // определяем kind как в оригинале: сначала wheel_redeems, иначе passport_rewards
-    const r: any = await db.prepare(
-      `SELECT id, tg_id, prize_code, prize_title, status
-       FROM wheel_redeems
-       WHERE app_public_id = ? AND redeem_code = ?
-       LIMIT 1`
-    ).bind(appPublicId, redeemCode).first();
+
 
     if (!r) {
       const pr: any = await db.prepare(
