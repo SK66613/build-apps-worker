@@ -17,7 +17,7 @@ jobs:
       - name: Install wrangler
         run: npm i -g wrangler
 
-      - name: Export D1 dump (schema + data)
+      - name: Export D1 dump (schema + data) [REMOTE]
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -29,11 +29,11 @@ jobs:
           echo "Listing D1 databases..."
           wrangler d1 list
 
-          echo "Exporting full dump..."
-          wrangler d1 export DB --output dump.sql
+          echo "Exporting REMOTE full dump..."
+          wrangler d1 export DB --remote --output dump.sql
 
-          echo "Exporting schema only..."
-          wrangler d1 execute DB --command ".schema" > schema.sql
+          echo "Exporting REMOTE schema only..."
+          wrangler d1 export DB --remote --schema-only --output schema.sql
 
           echo "Done. Files:"
           ls -lah dump.sql schema.sql
@@ -45,5 +45,3 @@ jobs:
           path: |
             dump.sql
             schema.sql
-
-            
