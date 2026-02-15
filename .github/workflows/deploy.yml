@@ -15,9 +15,18 @@ jobs:
           node-version: 20
           cache: 'npm'
 
-      # Быстро и предсказуемо (с package-lock.json)
       - run: npm ci --prefer-offline --no-audit
 
-      - run: npm run deploy
+      - name: Apply D1 migrations (remote)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -e
+          npx wrangler --version
+          npx wrangler d1 migrations apply DB --remote
+
+      - name: Deploy Worker
+        run: npm run deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
