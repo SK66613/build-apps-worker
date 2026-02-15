@@ -17,26 +17,27 @@ jobs:
       - name: Install wrangler
         run: npm i -g wrangler
 
-      - name: Export D1 dump (schema + data) [REMOTE]
+      - name: Export D1 dump + schema
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -e
+
           echo "Wrangler version:"
           wrangler --version
 
-          echo "Listing D1 databases..."
+          echo "Listing databases:"
           wrangler d1 list
 
-          echo "Exporting REMOTE full dump..."
+          echo "Exporting FULL dump..."
           wrangler d1 export DB --remote --output dump.sql
 
-          echo "Exporting REMOTE schema only..."
-          wrangler d1 export DB --remote --schema-only --output schema.sql
+          echo "Exporting SCHEMA only..."
+          wrangler d1 export DB --remote --no-data --output schema.sql
 
-          echo "Done. Files:"
-          ls -lah dump.sql schema.sql
+          echo "Done:"
+          ls -lh dump.sql schema.sql
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
