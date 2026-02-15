@@ -11,6 +11,19 @@ import { handleWheelMiniApi } from "./mini/wheel";
 import { buildState } from "./mini/state";
 import { awardCoins, spendCoinsIfEnough } from "./mini/coins";
 
+function logMiniWheelEvent(event: {
+  code: string;
+  msg: string;
+  appPublicId: string;
+  tgUserId: string;
+  route: string;
+  extra?: Record<string, any>;
+}) {
+  try {
+    console.log(JSON.stringify(event));
+  } catch (_) {}
+}
+
 function safeJson(obj: any, maxLen = 8000) {
   try {
     const s = JSON.stringify(obj);
@@ -258,15 +271,6 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     body = await request.json();
   } catch (_) {}
 
-  const initDataRaw = body.init_data || body.initData || null;
-  const tg = body.tg_user || {};
-  if (!tg || !tg.id) return json({ ok: false, error: "NO_TG_USER_ID" }, 400, request);
-
-  const ctx = await requireTgAndVerify(publicId, initDataRaw, env);
-  if (!(ctx as any).ok) return json({ ok: false, error: (ctx as any).error || "AUTH_FAILED" }, (ctx as any).status || 403, request);
-
-  await upsertAppUser(db, (ctx as any).appId, (ctx as any).publicId, tg);
-
   // type resolution
   let type = body.type || url.searchParams.get("type") || "";
   if (!type) {
@@ -275,6 +279,38 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
   }
   if (type === "claim") type = "claim_prize";
   if (type === "quiz") type = "quiz_state";
+
+  const initDataRaw = body.init_data || body.initData || url.searchParams.get("init_data") || url.searchParams.get("initData") || null;
+  const tg = (body.tg_user && body.tg_user.id ? body.tg_user : parseInitDataUser(String(initDataRaw || ""))) || {};
+  if (!tg || !tg.id) {
+    if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
+      logMiniWheelEvent({
+        code: "mini.wheel.spin.fail.invalid_initdata",
+        msg: "Missing tg user in request",
+        appPublicId: String(publicId || ""),
+        tgUserId: "",
+        route: "wheel.spin",
+      });
+    }
+    return json({ ok: false, error: "NO_TG_USER_ID" }, 400, request);
+  }
+
+  const ctx = await requireTgAndVerify(publicId, initDataRaw, env);
+  if (!(ctx as any).ok) {
+    if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
+      logMiniWheelEvent({
+        code: "mini.wheel.spin.fail.invalid_initdata",
+        msg: "Init data verification failed",
+        appPublicId: String(publicId || ""),
+        tgUserId: String(tg.id || ""),
+        route: "wheel.spin",
+        extra: { error: (ctx as any).error || "AUTH_FAILED" },
+      });
+    }
+    return json({ ok: false, error: (ctx as any).error || "AUTH_FAILED" }, (ctx as any).status || 403, request);
+  }
+
+  await upsertAppUser(db, (ctx as any).appId, (ctx as any).publicId, tg);
 
   const payload = body.payload || {};
 
