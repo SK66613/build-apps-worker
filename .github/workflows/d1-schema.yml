@@ -1,4 +1,4 @@
-name: D1 schema export
+name: D1 full dump
 
 on:
   workflow_dispatch:
@@ -17,20 +17,31 @@ jobs:
       - name: Install wrangler
         run: npm i -g wrangler
 
-      - name: Export schema (.schema)
+      - name: Export D1 dump (schema + data)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -e
+          echo "Wrangler version:"
+          wrangler --version
+
           echo "Listing D1 databases..."
           wrangler d1 list
-          echo "Dumping schema..."
-          wrangler d1 execute miniapp_saas --command ".schema" > schema.sql
-          echo "Done."
 
-      - name: Upload artifact
+          echo "Exporting full dump..."
+          wrangler d1 export DB --output dump.sql
+
+          echo "Exporting schema only..."
+          wrangler d1 execute DB --command ".schema" > schema.sql
+
+          echo "Done. Files:"
+          ls -lah dump.sql schema.sql
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: d1-schema
-          path: schema.sql
+          name: d1-dump
+          path: |
+            dump.sql
+            schema.sql
