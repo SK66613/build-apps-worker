@@ -49,17 +49,31 @@ export async function verifyToken(token: string, secret: string): Promise<any | 
   const enc = new TextEncoder();
   const data = headerB64 + "." + payloadB64;
 
+  try {
+    const header = JSON.parse(new TextDecoder().decode(base64UrlDecode(headerB64)));
+    if (header?.alg !== "HS256" || header?.typ !== "JWT") return null;
+  } catch {
+    return null;
+  }
+
   const key = await crypto.subtle.importKey(
     "raw",
     enc.encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign"]
+    ["verify"]
   );
-  const expectedSig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
-  const expectedSigB64 = base64UrlEncode(new Uint8Array(expectedSig));
 
-  if (expectedSigB64 !== sigB64) return null;
+  let signatureBytes: Uint8Array;
+  try {
+    signatureBytes = base64UrlDecode(sigB64);
+  } catch {
+    return null;
+  }
+
+  const signatureBuffer = signatureBytes.buffer.slice(signatureBytes.byteOffset, signatureBytes.byteOffset + signatureBytes.byteLength);
+  const isValidSig = await crypto.subtle.verify("HMAC", key, signatureBuffer, enc.encode(data));
+  if (!isValidSig) return null;
 
   try {
     const bytes = base64UrlDecode(payloadB64);

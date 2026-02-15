@@ -29,6 +29,13 @@ async function fetchFromUpstreams(pathRel: string, request: Request): Promise<Re
     try {
       const u = new URL(rel, base);
 
+      // Security: keep proxy strictly inside allowed upstream prefix.
+      // This blocks absolute URLs (e.g. http://evil.tld), protocol-relative paths,
+      // and path traversal attempts that could escape /sg-blocks/.
+      if (u.origin !== new URL(base).origin || !u.pathname.startsWith(new URL(base).pathname)) {
+        throw new Error(`Blocked unsafe blocks path: ${rel}`);
+      }
+
       // Edge cache key (только GET)
       const cacheKey = new Request(u.toString(), { method: "GET" });
       const cache = caches.default;

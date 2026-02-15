@@ -1,6 +1,16 @@
 // src/services/telegramInitData.ts
 // Telegram WebApp initData verification + helpers.
 
+function safeHexEqual(a: string, b: string): boolean {
+  const aa = String(a || "").toLowerCase();
+  const bb = String(b || "").toLowerCase();
+  if (aa.length !== bb.length) return false;
+
+  let diff = 0;
+  for (let i = 0; i < aa.length; i++) diff |= aa.charCodeAt(i) ^ bb.charCodeAt(i);
+  return diff === 0;
+}
+
 export async function verifyInitDataSignature(initData: string, botToken: string): Promise<boolean> {
   if (!initData || !botToken) return false;
 
@@ -43,7 +53,7 @@ export async function verifyInitDataSignature(initData: string, botToken: string
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
 
-  return calcHash === String(hash).toLowerCase();
+  return safeHexEqual(calcHash, String(hash));
 }
 
 export function parseInitDataUser(initData: string): any | null {
