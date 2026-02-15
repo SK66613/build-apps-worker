@@ -1,0 +1,36 @@
+name: D1 schema export
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install wrangler
+        run: npm i -g wrangler
+
+      - name: Export schema (.schema)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -e
+          echo "Listing D1 databases..."
+          wrangler d1 list
+          echo "Dumping schema..."
+          wrangler d1 execute miniapp_saas --command ".schema" > schema.sql
+          echo "Done."
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-schema
+          path: schema.sql
