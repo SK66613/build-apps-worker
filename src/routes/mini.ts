@@ -262,84 +262,38 @@ async function quizFinish(db: any, appId: any, appPublicId: string, tgId: any, d
 
 // ================== MINI API ==================
 async function handleMiniApi(request: Request, env: Env, url: URL) {
-const db: any = env.DB;
+  const db: any = env.DB;
+  const publicId = url.searchParams.get("public_id") || (url.pathname || "").split("/").pop() || "";
 
-// ✅ читаем JSON (1 раз)
-let body: any = {};
-try { body = await request.json(); } catch (_) {}
-
-// ✅ type resolution (как было)
-let type = body.type || url.searchParams.get("type") || "";
-if (!type) {
-  const seg = (url.pathname || "").split("/").filter(Boolean).pop();
-  type = seg || "";
-}
-if (type === "claim") type = "claim_prize";
-if (type === "quiz") type = "quiz_state";
-
-// ✅ public_id/app_public_id — ТОЛЬКО из query/body, НЕ из path
-const qPublicId =
-  url.searchParams.get("public_id") ||
-  url.searchParams.get("app_public_id") ||
-  "";
-
-const bPublicId = String(
-  body?.app_public_id ||
-  body?.public_id ||
-  body?.appPublicId ||
-  body?.publicId ||
-  body?.payload?.app_public_id ||
-  body?.payload?.public_id ||
-  ""
-).trim();
-
-const publicId = String(qPublicId || bPublicId || "").trim();
-
-if (!publicId) {
-  return json({ ok: false, error: "NO_PUBLIC_ID" }, 400, request);
-}
-
-// ✅ initData
-const initDataRaw =
-  body.init_data ||
-  body.initData ||
-  url.searchParams.get("init_data") ||
-  url.searchParams.get("initData") ||
-  null;
-
-const tg =
-  (body.tg_user && body.tg_user.id
-    ? body.tg_user
-    : parseInitDataUser(String(initDataRaw || ""))) || {};
-
-if (!tg || !tg.id) {
-  // ✅ диагностируем ВСЕ mini-роуты, не только spin
+  // читаем JSON
+  let body: any = {};
   try {
-    console.log(JSON.stringify({
-      code: "mini.auth.fail.no_tg_user",
-      type,
-      publicId: String(publicId || ""),
-      hasInitData: !!initDataRaw,
-      initDataLen: String(initDataRaw || "").length,
-      hasTgUserInBody: !!(body?.tg_user && body.tg_user.id),
-      bodyKeys: Object.keys(body || {}).slice(0, 40),
-    }));
+    body = await request.json();
   } catch (_) {}
 
-  // твой спец-лог для колеса (оставляем как было)
-  if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
-    logMiniWheelEvent({
-      code: "mini.wheel.spin.fail.invalid_initdata",
-      msg: "Missing tg user in request",
-      appPublicId: String(publicId || ""),
-      tgUserId: "",
-      route: "wheel.spin",
-    });
+  // type resolution
+  let type = body.type || url.searchParams.get("type") || "";
+  if (!type) {
+    const seg = (url.pathname || "").split("/").filter(Boolean).pop();
+    type = seg || "";
   }
+  if (type === "claim") type = "claim_prize";
+  if (type === "quiz") type = "quiz_state";
 
-  return json({ ok: false, error: "NO_TG_USER_ID" }, 400, request);
-}
-
+  const initDataRaw = body.init_data || body.initData || url.searchParams.get("init_data") || url.searchParams.get("initData") || null;
+  const tg = (body.tg_user && body.tg_user.id ? body.tg_user : parseInitDataUser(String(initDataRaw || ""))) || {};
+  if (!tg || !tg.id) {
+    if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
+      logMiniWheelEvent({
+        code: "mini.wheel.spin.fail.invalid_initdata",
+        msg: "Missing tg user in request",
+        appPublicId: String(publicId || ""),
+        tgUserId: "",
+        route: "wheel.spin",
+      });
+    }
+    return json({ ok: false, error: "NO_TG_USER_ID" }, 400, request);
+  }
 
   const ctx = await requireTgAndVerify(publicId, initDataRaw, env);
   if (!(ctx as any).ok) {
