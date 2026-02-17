@@ -11,6 +11,7 @@ import { handleWheelMiniApi } from "./mini/wheel";
 import { buildState } from "./mini/state";
 import { awardCoins, spendCoinsIfEnough } from "./mini/coins";
 
+// Prefer D1 for wheel spin_cost (fresh after publish), fallback to cfg if no column/rows
 async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number | null> {
   try {
     const row: any = await db
@@ -26,7 +27,6 @@ async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number |
     return null;
   }
 }
-
 
 function logMiniWheelEvent(event: {
   code: string;
@@ -194,7 +194,10 @@ async function bindReferralOnce(db: any, appPublicId: string, inviteeTgId: any, 
   if (!a || !invitee || !ref) return { ok: false, skipped: true, reason: "empty" };
   if (ref === invitee) return { ok: false, skipped: true, reason: "self" };
 
-  const ex = await db.prepare(`SELECT id FROM referrals WHERE app_public_id=? AND invitee_tg_id=? LIMIT 1`).bind(a, invitee).first();
+  const ex = await db
+    .prepare(`SELECT id FROM referrals WHERE app_public_id=? AND invitee_tg_id=? LIMIT 1`)
+    .bind(a, invitee)
+    .first();
   if (ex) return { ok: true, skipped: true, reason: "already_bound" };
 
   await db
@@ -297,8 +300,16 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
   if (type === "claim") type = "claim_prize";
   if (type === "quiz") type = "quiz_state";
 
-  const initDataRaw = body.init_data || body.initData || url.searchParams.get("init_data") || url.searchParams.get("initData") || null;
-  const tg = (body.tg_user && body.tg_user.id ? body.tg_user : parseInitDataUser(String(initDataRaw || ""))) || {};
+  const initDataRaw =
+    body.init_data ||
+    body.initData ||
+    url.searchParams.get("init_data") ||
+    url.searchParams.get("initData") ||
+    null;
+
+  const tg =
+    (body.tg_user && body.tg_user.id ? body.tg_user : parseInitDataUser(String(initDataRaw || ""))) || {};
+
   if (!tg || !tg.id) {
     if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
       logMiniWheelEvent({
@@ -333,7 +344,11 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
 
   // ====== state
   if (type === "state") {
-    const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
+    // prefer LIVE by publicId (same logic as wheel.spin), fallback to app:<appId>
+    const liveObj = await env.APPS.get("app:live:" + (ctx as any).publicId, "json").catch(() => null);
+    const appObj =
+      liveObj || (await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null));
+
     const cfg =
       (appObj as any) && ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
         ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
@@ -362,6 +377,7 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     }
 
     return json({ ok: true, state }, 200, request);
+  }
 
   // ====== wheel module
   {
@@ -411,7 +427,8 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
       const [h, m] = String(hhmm).split(":").map((n) => +n);
       return h * 60 + m;
     };
-    const fmt = (m: number) => String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+    const fmt = (m: number) =>
+      String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
 
     const w = new Date(date + "T00:00:00").getDay();
 
