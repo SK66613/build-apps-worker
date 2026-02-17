@@ -35,29 +35,67 @@ export function extractRuntimeConfigFromBlueprint(BP: any) {
     return (p && typeof p === "object") ? p : {};
   };
 
-  // Wheel
-  const wheel = insts.find((b) => b && (b.key === "bonus_wheel_one" || b.type === "bonus_wheel_one"));
-  if (wheel) {
-    const p: any = getProps(wheel);
-    cfg.wheel.spin_cost = Number(p.spin_cost || 0);
-    cfg.wheel.claim_cooldown_h = Number(p.claim_cooldown_h || 24);
-    cfg.wheel.daily_limit = Number(p.daily_limit || 0);
+// Wheel
+const wheel = insts.find((b) => b && (b.key === "bonus_wheel_one" || b.type === "bonus_wheel_one"));
+if (wheel) {
+  const p: any = getProps(wheel);
+  cfg.wheel.spin_cost = Number(p.spin_cost || 0);
+  cfg.wheel.claim_cooldown_h = Number(p.claim_cooldown_h || 24);
+  cfg.wheel.daily_limit = Number(p.daily_limit || 0);
 
-    const arr = Array.isArray(p.prizes) ? p.prizes : (Array.isArray(p.sectors) ? p.sectors : []);
-    cfg.wheel.prizes = arr
-      .map((pr: any) => {
-        const wRaw = Number(pr && pr.weight);
-        const cRaw = Number(pr && pr.coins);
-        return {
-          code: String((pr && pr.code) || "").trim(),
-          title: String((pr && (pr.title || pr.name || pr.code)) || "").trim(),
-          weight: Number.isFinite(wRaw) ? Math.max(0, Math.round(wRaw)) : 1,
-          coins: Number.isFinite(cRaw) ? Math.max(0, Math.round(cRaw)) : 0,
-          active: (pr && pr.active === false) ? false : true,
-        };
-      })
-      .filter((x: any) => x.code);
-  }
+  const arr = Array.isArray(p.prizes) ? p.prizes : (Array.isArray(p.sectors) ? p.sectors : []);
+  cfg.wheel.prizes = arr
+    .map((pr: any) => {
+      const wRaw = Number(pr && pr.weight);
+      const cRaw = Number(pr && pr.coins);
+
+      const kindRaw = String(pr?.kind || "").toLowerCase();
+      const kind =
+        kindRaw === "coins" ? "coins" :
+        kindRaw === "item" ? "item" :
+        kindRaw === "physical" ? "item" :
+        (Number.isFinite(cRaw) && cRaw > 0) ? "coins" : "item";
+
+      const costCentRaw = Number(pr?.cost_cent ?? pr?.cost ?? 0);
+      const qtyLeftRaw = Number(pr?.qty_left ?? pr?.stock_qty ?? 0);
+
+      const trackQty =
+        pr?.track_qty === true ||
+        Number(pr?.track_qty || 0) === 1 ||
+        pr?.stock_qty !== undefined;
+
+      const stopWhenZero =
+        pr?.stop_when_zero === undefined ? true : !!pr.stop_when_zero;
+
+      return {
+        code: String((pr && pr.code) || "").trim(),
+        title: String((pr && (pr.title || pr.name || pr.code)) || "").trim(),
+
+        // IMPORTANT: editor stores basis points already (pct*100)
+        weight: Number.isFinite(wRaw) ? Math.max(0, Math.round(wRaw)) : 0,
+
+        // kind + coins
+        kind,
+        coins: (kind === "coins" && Number.isFinite(cRaw)) ? Math.max(0, Math.round(cRaw)) : 0,
+
+        active: (pr && pr.active === false) ? false : true,
+
+        // visual
+        img: pr?.img ? String(pr.img) : "",
+
+        // economics / inventory (item only)
+        cost_cent: (kind === "item" && Number.isFinite(costCentRaw)) ? Math.max(0, Math.round(costCentRaw)) : 0,
+        cost_currency: String(pr?.cost_currency ?? pr?.currency ?? "RUB"),
+        cost_currency_custom: String(pr?.cost_currency_custom ?? pr?.currency_custom ?? ""),
+
+        track_qty: (kind === "item") ? !!trackQty : false,
+        qty_left: (kind === "item" && Number.isFinite(qtyLeftRaw)) ? Math.max(0, Math.round(qtyLeftRaw)) : 0,
+        stop_when_zero: (kind === "item") ? !!stopWhenZero : true,
+      };
+    })
+    .filter((x: any) => x.code);
+}
+
 
   // Styles passport
   const passp = insts.find((b) => b && (b.key === "styles_passport_one" || b.type === "styles_passport_one"));
