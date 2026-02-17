@@ -11,6 +11,23 @@ import { handleWheelMiniApi } from "./mini/wheel";
 import { buildState } from "./mini/state";
 import { awardCoins, spendCoinsIfEnough } from "./mini/coins";
 
+async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number | null> {
+  try {
+    const row: any = await db
+      .prepare(`SELECT MAX(spin_cost) AS spin_cost FROM wheel_prizes WHERE app_public_id=?`)
+      .bind(appPublicId)
+      .first();
+
+    const v = Number(row?.spin_cost);
+    return Number.isFinite(v) ? Math.max(0, Math.floor(v)) : null;
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (/no such column:\s*spin_cost/i.test(msg)) return null;
+    return null;
+  }
+}
+
+
 function logMiniWheelEvent(event: {
   code: string;
   msg: string;
@@ -335,8 +352,16 @@ async function handleMiniApi(request: Request, env: Env, url: URL) {
     }
 
     const state = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
+
+    // Prefer D1 for wheel spin_cost (fresh after publish), fallback keeps existing config
+    const spinCostDb = await getSpinCostFromDb(db, (ctx as any).publicId);
+    if (spinCostDb !== null) {
+      state.config = state.config || {};
+      state.config.wheel = state.config.wheel || {};
+      state.config.wheel.spin_cost = spinCostDb;
+    }
+
     return json({ ok: true, state }, 200, request);
-  }
 
   // ====== wheel module
   {
