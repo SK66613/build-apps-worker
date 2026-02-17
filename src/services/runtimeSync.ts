@@ -23,8 +23,12 @@ export async function syncRuntimeTablesFromConfig(appId: any, publicId: string, 
 
     const wheelCols = await getTableCols(db, "wheel_prizes");
 
+    // wheel spin cost (store in D1 if column exists)
+    const spinCost = Math.max(0, Math.floor(Number(cfg?.wheel?.spin_cost ?? 0)));
+
     await db.prepare(`DELETE FROM wheel_prizes WHERE app_public_id = ?`).bind(publicId).run();
     const prizes = (cfg?.wheel && Array.isArray(cfg.wheel.prizes)) ? cfg.wheel.prizes : [];
+
 
     for (const p of prizes) {
       const code = String(p?.code || "").trim();
@@ -65,6 +69,15 @@ export async function syncRuntimeTablesFromConfig(appId: any, publicId: string, 
       await db.prepare(`INSERT INTO wheel_prizes (${cols}) VALUES (${qs})`).bind(...vals).run();
       out.wheelInserted++;
     }
+
+    // Persist spin_cost into D1 (one value per app; duplicated across rows intentionally)
+    if (wheelCols.has("spin_cost")) {
+      await db.prepare(
+        `UPDATE wheel_prizes SET spin_cost = ? WHERE app_public_id = ?`
+      ).bind(spinCost, publicId).run();
+    }
+
+    
 
     // styles_dict — как у тебя было (ок)
     await db.prepare(`DELETE FROM styles_dict WHERE app_public_id = ?`).bind(publicId).run();
