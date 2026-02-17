@@ -259,14 +259,13 @@ const spinCost = (spinCostFromDb !== null) ? spinCostFromDb : spinCostFromCfg;
     // 1) create spin row (status new)
     let ins: any;
     try {
-      ins = await db
-        .prepare(
-          ``INSERT INTO wheel_spins (app_id, app_public_id, tg_id, status, prize_code, prize_title, spin_cost, prize_coins)
- VALUES (?, ?, ?, 'new', '', '', ?, 0)`
-
-        )
-        .bind((ctx as any).appId, appPublicId, tgUserId, spinCost)
-        .run();
+ins = await db
+  .prepare(
+    `INSERT INTO wheel_spins (app_id, app_public_id, tg_id, status, prize_code, prize_title, spin_cost, prize_coins)
+     VALUES (?, ?, ?, 'new', '', '', ?, 0)`
+  )
+  .bind((ctx as any).appId, appPublicId, tgUserId, spinCost)
+  .run();
     } catch (e: any) {
       logWheelEvent({
         code: "mini.wheel.spin.fail.db_error",
@@ -648,8 +647,6 @@ try {
   }
 }
 
-      return json({ ok: false, error: "SPIN_UPDATE_FAILED" }, 500, request);
-    }
 
     // 7) count issued rewards
     let rewardsCountRow: any;
