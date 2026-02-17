@@ -261,8 +261,9 @@ const spinCost = (spinCostFromDb !== null) ? spinCostFromDb : spinCostFromCfg;
     try {
       ins = await db
         .prepare(
-          `INSERT INTO wheel_spins (app_id, app_public_id, tg_id, status, prize_code, prize_title, spin_cost)
-           VALUES (?, ?, ?, 'new', '', '', ?)`
+          ``INSERT INTO wheel_spins (app_id, app_public_id, tg_id, status, prize_code, prize_title, spin_cost, prize_coins)
+ VALUES (?, ?, ?, 'new', '', '', ?, 0)`
+
         )
         .bind((ctx as any).appId, appPublicId, tgUserId, spinCost)
         .run();
@@ -486,6 +487,21 @@ if (kind === "coins" && prizeCoins > 0) {
     return json({ ok: false, error: "AWARD_COINS_FAILED" }, 500, request);
   }
 
+await db.prepare(
+  `UPDATE wheel_spins
+   SET status='redeemed',
+       prize_code=?,
+       prize_title=?,
+       prize_coins=?,
+       ts_issued=datetime('now'),
+       ts_redeemed=datetime('now'),
+       redeemed_by_tg=?
+   WHERE id=?`
+)
+.bind(String(prize.code || ""), String(prize.title || ""), prizeCoins, String(tgUserId), spinId)
+.run()
+.catch(async () => {
+  // fallback for older schema without prize_coins
   await db.prepare(
     `UPDATE wheel_spins
      SET status='redeemed',
@@ -495,19 +511,9 @@ if (kind === "coins" && prizeCoins > 0) {
          ts_redeemed=datetime('now'),
          redeemed_by_tg=?
      WHERE id=?`
-  )
-  .bind(String(prize.code || ""), String(prize.title || ""), String(tgUserId), spinId)
-  .run()
-  .catch(async () => {
-    await db.prepare(
-      `UPDATE wheel_spins
-       SET status='redeemed',
-           prize_code=?,
-           prize_title=?,
-           ts_issued=datetime('now')
-       WHERE id=?`
-    ).bind(String(prize.code || ""), String(prize.title || ""), spinId).run().catch(() => null);
-  });
+  ).bind(String(prize.code || ""), String(prize.title || ""), String(tgUserId), spinId).run().catch(() => null);
+});
+
 
   const fresh_state = await buildState(db, (ctx as any).appId, appPublicId, tg.id, cfg);
 
@@ -607,28 +613,41 @@ if (kind === "coins" && prizeCoins > 0) {
     }
 
     // 6) update spin status -> issued
-    try {
-      await db
-        .prepare(
-          `UPDATE wheel_spins
-           SET status='issued',
-               prize_code=?,
-               prize_title=?,
-               redeem_id=?,
-               ts_issued=datetime('now')
-           WHERE id=?`
-        )
-        .bind(String(prize.code || ""), String(prize.title || ""), Number(redeem.id), spinId)
-        .run();
-    } catch (e: any) {
-      logWheelEvent({
-        code: "mini.wheel.spin.fail.db_error",
-        msg: "Failed to update spin status",
-        appPublicId,
-        tgUserId,
-        route,
-        extra: { spinId, error: String(e?.message || e) },
-      });
+try {
+  await db
+    .prepare(
+      `UPDATE wheel_spins
+       SET status='issued',
+           prize_code=?,
+           prize_title=?,
+           prize_coins=?,
+           redeem_id=?,
+           ts_issued=datetime('now')
+       WHERE id=?`
+    )
+    .bind(String(prize.code || ""), String(prize.title || ""), prizeCoins, Number(redeem.id), spinId)
+    .run();
+} catch (e: any) {
+  const msg = String(e?.message || e);
+  // fallback for older schema without prize_coins
+  if (/no such column:\s*prize_coins/i.test(msg)) {
+    await db
+      .prepare(
+        `UPDATE wheel_spins
+         SET status='issued',
+             prize_code=?,
+             prize_title=?,
+             redeem_id=?,
+             ts_issued=datetime('now')
+         WHERE id=?`
+      )
+      .bind(String(prize.code || ""), String(prize.title || ""), Number(redeem.id), spinId)
+      .run();
+  } else {
+    throw e;
+  }
+}
+
       return json({ ok: false, error: "SPIN_UPDATE_FAILED" }, 500, request);
     }
 
