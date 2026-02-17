@@ -231,6 +231,10 @@ async function reserveOneIfNeeded(db: any, appPublicId: string, prizeCode: strin
 export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | null> {
   const { request, env, db, type, payload, tg, ctx, buildState, spendCoinsIfEnough, awardCoins } = args;
 
+    // cfg must be defined in function scope (used in multiple branches)
+  let cfg: any = {};
+
+
   // ====== wheel.spin (bonus_wheel_one)
   if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
     const route = "wheel.spin";
