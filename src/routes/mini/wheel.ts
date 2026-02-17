@@ -23,6 +23,32 @@ function randomRedeemCodeLocal(len = 10) {
   return "SG-" + s.slice(0, 4) + "-" + s.slice(4, 8) + (len > 8 ? "-" + s.slice(8) : "");
 }
 
+
+
+async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number | null> {
+  try {
+    // берём стабильное значение даже если вдруг где-то рассинк: MAX()
+    const row: any = await db
+      .prepare(`SELECT MAX(spin_cost) AS spin_cost FROM wheel_prizes WHERE app_public_id=?`)
+      .bind(appPublicId)
+      .first();
+
+    const v = Number(row?.spin_cost);
+    return Number.isFinite(v) ? Math.max(0, Math.floor(v)) : null;
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    // если колонки нет — просто fallback на cfg
+    if (/no such column:\s*spin_cost/i.test(msg)) return null;
+    return null;
+  }
+}
+
+
+
+
+
+
+
 type PrizeRow = {
   code: string;
   title: string;
@@ -211,18 +237,9 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     const appPublicId = String((ctx as any).publicId || "");
     const tgUserId = String(tg?.id || "");
 
-// config from KV (prefer LIVE by publicId)
-const liveObj = await env.APPS.get("app:live:" + appPublicId, "json").catch(() => null);
-const appObj  = liveObj || (await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null));
-
-const cfg =
-  (appObj as any) &&
-  ((appObj as any).runtime_config ?? (appObj as any).app_config ?? (appObj as any).config)
-    ? ((appObj as any).runtime_config ?? (appObj as any).app_config ?? (appObj as any).config)
-    : {};
-
-// Spin cost: ONLY from cfg (payload override оставляем как супер-fallback)
-const spinCost = Math.max(
+// Spin cost: prefer D1 (wheel_prizes.spin_cost), fallback to cfg (KV) if empty/no column
+const spinCostFromDb = await getSpinCostFromDb(db, appPublicId);
+const spinCostFromCfg = Math.max(
   0,
   Math.floor(
     Number(
@@ -231,6 +248,8 @@ const spinCost = Math.max(
     )
   )
 );
+const spinCost = (spinCostFromDb !== null) ? spinCostFromDb : spinCostFromCfg;
+
 
 
     // 1) create spin row (status new)
@@ -409,10 +428,13 @@ const spinCost = Math.max(
       return json({ ok: false, error: "NO_AVAILABLE_PRIZES" }, 409, request);
     }
 
-    // 4) compute snapshot
-    const prizeCoins = Math.max(0, Math.floor(Number(prDetails?.coins ?? prize.coins ?? 0)));
-    const prizeImg = String((prDetails?.img ?? prize.img ?? "") || "");
-    const kind = String(prDetails?.kind || prize.kind || (prizeCoins > 0 ? "coins" : "item"));
+const prizeCoins = Math.max(0, Math.floor(Number(prDetails?.coins ?? prize.coins ?? 0)));
+const prizeImg = String((prDetails?.img ?? prize.img ?? "") || "");
+
+// kind: auto-award coins ONLY when kind explicitly "coins"
+const kindRaw = String((prDetails?.kind ?? prize.kind ?? "") || "").trim().toLowerCase();
+const kind = (kindRaw === "coins") ? "coins" : "item";
+
 
 
 
