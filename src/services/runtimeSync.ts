@@ -60,23 +60,22 @@ for (const p of prizes) {
     ? ((p.stop_when_zero === undefined ? true : !!p.stop_when_zero) ? 1 : 0)
     : 1;
 
-await db.prepare(
-  `INSERT INTO wheel_prizes
-    (app_id, app_public_id, code, title, weight, active, coins, kind, img,
-     cost_cent, cost_currency,
-     track_qty, qty_left, stop_when_zero)
-   VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?,
-     ?, ?,
-     ?, ?, ?)`
-)
-.bind(
-  appId, publicId, code, title, weight, active, coins, kind, img,
-  cost_cent, cost_currency,
-  track_qty, qty_left, stop_when_zero
-)
-.run();
-
+  await db.prepare(
+    `INSERT INTO wheel_prizes
+      (app_id, app_public_id, code, title, weight, active, coins, kind, img,
+       cost_cent, cost_currency, cost_currency_custom,
+       track_qty, qty_left, stop_when_zero)
+     VALUES
+      (?, ?, ?, ?, ?, ?, ?, ?, ?,
+       ?, ?, ?,
+       ?, ?, ?)`
+  )
+  .bind(
+    appId, publicId, code, title, weight, active, coins, kind, img,
+    cost_cent, cost_currency, cost_currency_custom,
+    track_qty, qty_left, stop_when_zero
+  )
+  .run();
 
   out.wheelInserted++;
 }
