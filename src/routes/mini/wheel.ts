@@ -406,6 +406,55 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     const kind = String(prDetails?.kind || prize.kind || (prizeCoins > 0 ? "coins" : "item"));
 
 
+
+
+
+// ==== COINS PRIZE → instant award (no redeem) ====
+if (kind === "coins" && prizeCoins > 0) {
+
+  await awardCoins(
+    db,
+    (ctx as any).appId,
+    appPublicId,
+    tg.id,
+    prizeCoins,
+    "wheel_prize",
+    String(prize.code || ""),
+    "Wheel prize",
+    `wheel:prize:${appPublicId}:${tg.id}:${spinId}`
+  );
+
+  await db.prepare(`
+    UPDATE wheel_spins
+    SET status='completed',
+        prize_code=?,
+        prize_title=?,
+        ts_issued=datetime('now')
+    WHERE id=?`)
+    .bind(prize.code, prize.title, spinId)
+    .run();
+
+  const fresh_state = await buildState(
+    db,
+    (ctx as any).appId,
+    appPublicId,
+    tg.id,
+    cfg
+  );
+
+  return json({
+    ok:true,
+    prize:{ code:prize.code, title:prize.title, coins:prizeCoins },
+    instant:true,
+    rewards_count:0,
+    fresh_state
+  },200,request);
+}
+
+
+
+
+
     
 
     const coinCostCent = Math.max(
@@ -422,75 +471,113 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     const costCurrency = costCurrencyRaw ? String(costCurrencyRaw) : null;
 
 
-// ==== COINS PRIZE → instant award (no redeem row) ====
-if (kind === "coins" && prizeCoins > 0) {
-  const res: any = await awardCoins(
-    db,
-    (ctx as any).appId,
-    appPublicId,
-    tg.id,
-    prizeCoins,
-    "wheel_prize_coins",
-    String(spinId),
-    String(prize.title || "Wheel coins"),
-    `wheel:prize:${appPublicId}:${tg.id}:${spinId}:${prizeCoins}`
-  );
 
-  if (!res?.ok) {
-    // если приз не смогли начислить — откатим спин и вернем стоимость (чтобы не было “списали и не дали”)
+
+
+// ===== COINS prize: award immediately, no wallet item =====
+const isCoinsPrize = (kind === "coins") && prizeCoins > 0;
+
+if (isCoinsPrize) {
+  // 5a) award coins immediately
+  try {
+    await awardCoins(
+      db,
+      (ctx as any).appId,
+      (ctx as any).publicId,
+      tg.id,
+      prizeCoins,
+      "wheel_prize_coins",
+      String(spinId),
+      String(prize.title || "Wheel coins"),
+      `wheel:prize:${(ctx as any).publicId}:${tg.id}:${spinId}:${prizeCoins}`
+    );
+  } catch (e: any) {
+    // если начисление не удалось — лучше откатить спин (и вернуть стоимость)
+    // иначе будет “спин списал, а приз не дали”
     if (spinCost > 0) {
-      await awardCoins(
-        db,
-        (ctx as any).appId,
-        appPublicId,
-        tg.id,
-        spinCost,
-        "wheel_refund",
-        String(spinId),
-        "Refund: coins prize award failed",
-        `wheel:refund:${appPublicId}:${tg.id}:${spinId}`
-      ).catch(() => null);
+      try {
+        await awardCoins(
+          db,
+          (ctx as any).appId,
+          (ctx as any).publicId,
+          tg.id,
+          spinCost,
+          "wheel_refund",
+          String(spinId),
+          "Refund: coins prize award failed",
+          `wheel:refund:${(ctx as any).publicId}:${tg.id}:${spinId}`
+        );
+      } catch (_) {}
     }
-    await db.prepare(`DELETE FROM wheel_spins WHERE id=?`).bind(spinId).run().catch(() => null);
+    try { await db.prepare(`DELETE FROM wheel_spins WHERE id=?`).bind(spinId).run(); } catch (_) {}
 
     logWheelEvent({
-      code: "mini.wheel.spin.fail.award_coins_failed",
+      code: "mini.wheel.spin.fail.db_error",
       msg: "Failed to award coins prize",
       appPublicId,
       tgUserId,
       route,
-      extra: { spinId, err: res?.error || res?.msg || "unknown" },
+      extra: { spinId, error: String(e?.message || e) },
     });
 
     return json({ ok: false, error: "AWARD_COINS_FAILED" }, 500, request);
   }
 
-  // помечаем спин как завершенный сразу
-  await db.prepare(
-    `UPDATE wheel_spins
-     SET status='redeemed',
-         prize_code=?,
-         prize_title=?,
-         ts_issued=datetime('now'),
-         ts_redeemed=datetime('now'),
-         redeemed_by_tg=?
-     WHERE id=?`
-  )
-  .bind(String(prize.code || ""), String(prize.title || ""), String(tgUserId), spinId)
-  .run()
-  .catch(async () => {
-    // fallback если нет части колонок
+  // 5b) mark spin as redeemed immediately (no redeem row)
+  try {
     await db.prepare(
       `UPDATE wheel_spins
        SET status='redeemed',
            prize_code=?,
            prize_title=?,
-           ts_issued=datetime('now')
+           redeem_id=NULL,
+           ts_issued=datetime('now'),
+           ts_redeemed=datetime('now'),
+           redeemed_by_tg=?
        WHERE id=?`
-    ).bind(String(prize.code || ""), String(prize.title || ""), spinId).run().catch(() => null);
-  });
+    )
+    .bind(String(prize.code || ""), String(prize.title || ""), String(tgUserId), spinId)
+    .run();
+  } catch (_) {
+    // если в wheel_spins нет каких-то колонок — не валим спин, это не критично
+    try {
+      await db.prepare(
+        `UPDATE wheel_spins
+         SET status='redeemed',
+             prize_code=?,
+             prize_title=?,
+             ts_issued=datetime('now')
+         WHERE id=?`
+      )
+      .bind(String(prize.code || ""), String(prize.title || ""), spinId)
+      .run();
+    } catch (_) {}
+  }
 
-  const fresh_state = await buildState(db, (ctx as any).appId, appPublicId, tg.id, cfg);
+  // 6) rewards_count = только issued (монетный приз не должен увеличивать)
+  let rewardsCountRow: any = null;
+  try {
+    rewardsCountRow = await db
+      .prepare(
+        `SELECT COUNT(*) AS c
+         FROM wheel_redeems
+         WHERE app_public_id=? AND tg_id=? AND status='issued'`
+      )
+      .bind(appPublicId, tgUserId)
+      .first();
+  } catch (_) {}
+
+  const rewards_count = Math.max(0, Number(rewardsCountRow?.c || 0));
+  const fresh_state = await buildState(db, (ctx as any).appId, (ctx as any).publicId, tg.id, cfg);
+
+  logWheelEvent({
+    code: "mini.wheel.spin.ok",
+    msg: "Spin completed (coins awarded immediately)",
+    appPublicId,
+    tgUserId,
+    route,
+    extra: { spinId, prizeCode: String(prize.code || ""), prizeCoins, rewards_count },
+  });
 
   return json(
     {
@@ -498,14 +585,17 @@ if (kind === "coins" && prizeCoins > 0) {
       prize: { code: prize.code || "", title: prize.title || "", coins: prizeCoins, img: prizeImg || "" },
       spin_cost: spinCost,
       spin_id: spinId,
-      rewards_count: 0,        // монетный приз не в “кошельке”
+      rewards_count,
       fresh_state,
-      auto_awarded: true,
+      auto_awarded: true, // полезно для фронта
     },
     200,
     request
   );
 }
+
+
+
 
 
     
