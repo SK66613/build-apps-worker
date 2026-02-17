@@ -161,67 +161,46 @@ async function getWheelPrizeDetails(db: any, appPublicId: string, prizeCode: str
   }
 }
 
-// Reserve 1 item at "issued". If schema doesn't have qty columns, return true (no tracking).
+// Reserve 1 item at "issued".
+// Rules:
+// - if track_qty=0 => no reserve
+// - if stop_when_zero=1 => must have qty_left>0
+// - if stop_when_zero=0 => allow reserve even when qty_left<=0 (but we don't decrement below 0)
 async function reserveOneIfNeeded(db: any, appPublicId: string, prizeCode: string, prRow: any): Promise<boolean> {
   const track = Number(prRow?.track_qty || 0) === 1;
   if (!track) return true;
 
+  const stop = Number(prRow?.stop_when_zero || 0) === 1;
+
   try {
-    const upd = await db
-      .prepare(
-        `UPDATE wheel_prizes
-         SET qty_left = qty_left - 1
-         WHERE app_public_id=?
-           AND code=?
-           AND track_qty=1
-           AND qty_left > 0`
-      )
-      .bind(String(appPublicId), String(prizeCode))
-      .run();
+    // If stop_when_zero=1 -> require qty_left>0 (and decrement)
+    // If stop_when_zero=0 -> allow even if qty_left<=0, but qty_left will not go negative.
+    const upd = await db.prepare(
+      `UPDATE wheel_prizes
+       SET qty_left = CASE
+         WHEN qty_left IS NULL THEN NULL
+         WHEN qty_left > 0 THEN qty_left - 1
+         ELSE qty_left
+       END
+       WHERE app_public_id=?
+         AND code=?
+         AND track_qty=1
+         AND (
+           ? = 0
+           OR (qty_left IS NOT NULL AND qty_left > 0)
+         )`
+    )
+    .bind(String(appPublicId), String(prizeCode), stop ? 1 : 0)
+    .run();
 
     return !!upd?.meta?.changes;
   } catch (e: any) {
     const msg = String(e?.message || e);
-    if (/no such column:\s*(track_qty|qty_left)/i.test(msg)) return true;
+    if (/no such column:\s*(track_qty|qty_left|stop_when_zero)/i.test(msg)) return true;
     throw e;
   }
 }
 
-type WheelArgs = {
-  request: Request;
-  env: Env;
-  db: any;
-  type: string;
-  payload: any;
-  tg: any;
-  ctx: any;
-
-  buildState: (db: any, appId: any, appPublicId: string, tgId: any, cfg: any) => Promise<any>;
-
-  spendCoinsIfEnough: (
-    db: any,
-    appId: any,
-    appPublicId: string,
-    tgId: any,
-    cost: any,
-    src: any,
-    ref_id: any,
-    note: any,
-    event_id: any
-  ) => Promise<any>;
-
-  awardCoins: (
-    db: any,
-    appId: any,
-    appPublicId: string,
-    tgId: any,
-    delta: any,
-    src: any,
-    ref_id: any,
-    note: any,
-    event_id: any
-  ) => Promise<any>;
-};
 
 export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | null> {
   const { request, env, db, type, payload, tg, ctx, buildState, spendCoinsIfEnough, awardCoins } = args;
