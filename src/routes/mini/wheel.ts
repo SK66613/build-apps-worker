@@ -211,18 +211,27 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     const appPublicId = String((ctx as any).publicId || "");
     const tgUserId = String(tg?.id || "");
 
-    // config from KV app object
-    const appObj = await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null);
-    const cfg =
-      (appObj as any) && ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
-        ? ((appObj as any).app_config ?? (appObj as any).runtime_config ?? (appObj as any).config)
-        : {};
+// config from KV (prefer LIVE by publicId)
+const liveObj = await env.APPS.get("app:live:" + appPublicId, "json").catch(() => null);
+const appObj  = liveObj || (await env.APPS.get("app:" + (ctx as any).appId, "json").catch(() => null));
 
-    // Spin cost: prefer cfg.wheel.spin_cost, allow payload override as fallback for backward compatibility
-    const spinCost = Math.max(
-      0,
-      Math.floor(Number((cfg as any)?.wheel?.spin_cost ?? (payload?.spin_cost ?? payload?.spin_cost_coins ?? 0)))
-    );
+const cfg =
+  (appObj as any) &&
+  ((appObj as any).runtime_config ?? (appObj as any).app_config ?? (appObj as any).config)
+    ? ((appObj as any).runtime_config ?? (appObj as any).app_config ?? (appObj as any).config)
+    : {};
+
+// Spin cost: ONLY from cfg (payload override оставляем как супер-fallback)
+const spinCost = Math.max(
+  0,
+  Math.floor(
+    Number(
+      (cfg as any)?.wheel?.spin_cost ??
+      (payload?.spin_cost ?? payload?.spin_cost_coins ?? 0)
+    )
+  )
+);
+
 
     // 1) create spin row (status new)
     let ins: any;
