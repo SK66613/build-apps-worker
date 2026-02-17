@@ -46,7 +46,7 @@ for (const p of prizes) {
   const cost_cent = (kind === "item" && Number.isFinite(costCentRaw)) ? Math.max(0, Math.round(costCentRaw)) : 0;
 
   const cost_currency = String(p.cost_currency ?? p.currency ?? "RUB");
-  const cost_currency_custom = String(p.cost_currency_custom ?? p.currency_custom ?? "");
+ 
 
   const track_qty =
     (kind === "item")
@@ -63,7 +63,7 @@ for (const p of prizes) {
   await db.prepare(
     `INSERT INTO wheel_prizes
       (app_id, app_public_id, code, title, weight, active, coins, kind, img,
-       cost_cent, cost_currency, cost_currency_custom,
+       cost_cent, cost_currency,
        track_qty, qty_left, stop_when_zero)
      VALUES
       (?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -72,7 +72,7 @@ for (const p of prizes) {
   )
   .bind(
     appId, publicId, code, title, weight, active, coins, kind, img,
-    cost_cent, cost_currency, cost_currency_custom,
+    cost_cent, cost_currency,
     track_qty, qty_left, stop_when_zero
   )
   .run();
