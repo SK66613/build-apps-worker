@@ -405,6 +405,58 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     const prizeImg = String((prDetails?.img ?? prize.img ?? "") || "");
     const kind = String(prDetails?.kind || prize.kind || (prizeCoins > 0 ? "coins" : "item"));
 
+
+
+
+
+// ==== COINS PRIZE → instant award (no redeem) ====
+if (kind === "coins" && prizeCoins > 0) {
+
+  await awardCoins(
+    db,
+    (ctx as any).appId,
+    appPublicId,
+    tg.id,
+    prizeCoins,
+    "wheel_prize",
+    String(prize.code || ""),
+    "Wheel prize",
+    `wheel:prize:${appPublicId}:${tg.id}:${spinId}`
+  );
+
+  await db.prepare(`
+    UPDATE wheel_spins
+    SET status='completed',
+        prize_code=?,
+        prize_title=?,
+        ts_issued=datetime('now')
+    WHERE id=?`)
+    .bind(prize.code, prize.title, spinId)
+    .run();
+
+  const fresh_state = await buildState(
+    db,
+    (ctx as any).appId,
+    appPublicId,
+    tg.id,
+    cfg
+  );
+
+  return json({
+    ok:true,
+    prize:{ code:prize.code, title:prize.title, coins:prizeCoins },
+    instant:true,
+    rewards_count:0,
+    fresh_state
+  },200,request);
+}
+
+
+
+
+
+    
+
     const coinCostCent = Math.max(
       0,
       Math.floor(Number((cfg as any)?.coins?.cost_cent_per_coin ?? (cfg as any)?.wheel?.coin_cost_cent ?? 0))
