@@ -5,7 +5,10 @@
 import type { Env } from "../index";
 import { jsonResponse } from "../services/http";
 import { getCanonicalPublicIdForApp } from "../services/apps";
-import { parseRangeOrDefault as _parseRangeOrDefault, daysBetweenInclusive as _daysBetweenInclusive } from "../services/analyticsRange";
+import {
+  parseRangeOrDefault as _parseRangeOrDefault,
+  daysBetweenInclusive as _daysBetweenInclusive
+} from "../services/analyticsRange";
 
 // NOTE: legacy used a helper for YYYY-MM-DD + N days.
 // Keep it local to avoid circular deps and to make the handler self-contained.
@@ -21,8 +24,36 @@ function addDaysIso(isoDate: string, days: number): string {
   return dt.toISOString().slice(0, 10);
 }
 
-const json = (obj: any, status = 200, request: Request | null = null) => jsonResponse(obj, status, request as any);
+function toInt(v: any, d = 0){
+  const n = Number(v);
+  if (!Number.isFinite(n)) return d;
+  return Math.trunc(n);
+}
 
+const json = (obj: any, status = 200, request: Request | null = null) =>
+  jsonResponse(obj, status, request as any);
+
+// ===== app_settings helper (coin value / currency) =====
+async function getAppSettingsForPublicId(env: Env, appPublicId: string){
+  try{
+    const row = await env.DB.prepare(
+      `SELECT coin_value_cents, currency
+       FROM app_settings
+       WHERE app_public_id = ?
+       LIMIT 1`
+    ).bind(appPublicId).first();
+
+    const coin_value_cents = Number(row?.coin_value_cents ?? 100);
+    const currency = String(row?.currency ?? 'RUB');
+
+    return {
+      coin_value_cents: (Number.isFinite(coin_value_cents) && coin_value_cents > 0) ? Math.floor(coin_value_cents) : 100,
+      currency: (currency || 'RUB').toUpperCase().slice(0, 8),
+    };
+  }catch(_){
+    return { coin_value_cents: 100, currency: 'RUB' };
+  }
+}
 
 export async function handleCabinetWheelStats(appId, request, env, ownerId){
   const url = new URL(request.url);
@@ -32,15 +63,6 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
 
   const fromOk = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : null;
   const toOk   = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : null;
-
-  function addDaysIso(iso, delta){
-    const d = new Date(iso + 'T00:00:00Z');
-    d.setUTCDate(d.getUTCDate() + delta);
-    const y = d.getUTCFullYear();
-    const m = String(d.getUTCMonth()+1).padStart(2,'0');
-    const day = String(d.getUTCDate()).padStart(2,'0');
-    return `${y}-${m}-${day}`;
-  }
 
   const toPlus1 = toOk ? addDaysIso(toOk, 1) : null;
 
@@ -118,7 +140,6 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
   return json({ ok:true, items }, 200, request);
 }
 
-
 export async function handleCabinetWheelTimeseries(appId, request, env, ownerId){
   const url = new URL(request.url);
 
@@ -127,15 +148,6 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
 
   const fromOk = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : null;
   const toOk   = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : null;
-
-  function addDaysIso(iso, delta){
-    const d = new Date(iso + 'T00:00:00Z');
-    d.setUTCDate(d.getUTCDate() + delta);
-    const y = d.getUTCFullYear();
-    const m = String(d.getUTCMonth()+1).padStart(2,'0');
-    const day = String(d.getUTCDate()).padStart(2,'0');
-    return `${y}-${m}-${day}`;
-  }
 
   const toPlus1 = toOk ? addDaysIso(toOk, 1) : null;
 
@@ -146,6 +158,9 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
   if (!appPublicId) {
     return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
   }
+
+  const settings = await getAppSettingsForPublicId(env, appPublicId);
+  const coinValueCents = settings.coin_value_cents;
 
   const db = env.DB;
 
@@ -167,7 +182,27 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
       SELECT
         substr(issued_at, 1, 10) AS d,
         COUNT(*) AS wins,
-        SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
+        SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed,
+
+        -- coin prizes cost (issued)
+        COALESCE(SUM(
+          CASE WHEN kind='coins' THEN COALESCE(coins,0) ELSE 0 END
+        ),0) AS prize_coins_issued,
+
+        -- coin prizes cost (redeemed)
+        COALESCE(SUM(
+          CASE WHEN status='redeemed' AND kind='coins' THEN COALESCE(coins,0) ELSE 0 END
+        ),0) AS prize_coins_redeemed,
+
+        -- item prizes cost (issued) in cents
+        COALESCE(SUM(
+          CASE WHEN kind!='coins' THEN COALESCE(cost_cent,0) ELSE 0 END
+        ),0) AS item_cost_issued_cents,
+
+        -- item prizes cost (redeemed) in cents
+        COALESCE(SUM(
+          CASE WHEN status='redeemed' AND kind!='coins' THEN COALESCE(cost_cent,0) ELSE 0 END
+        ),0) AS item_cost_redeemed_cents
       FROM wheel_redeems
       WHERE (app_id = ? OR app_public_id = ?)
         AND issued_at >= ?
@@ -181,10 +216,17 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
     )
     SELECT
       days.d AS date,
+
       COALESCE(spins.spins, 0) AS spins,
       COALESCE(spins.spin_cost_coins, 0) AS spin_cost_coins,
+
       COALESCE(redeems.wins, 0) AS wins,
-      COALESCE(redeems.redeemed, 0) AS redeemed
+      COALESCE(redeems.redeemed, 0) AS redeemed,
+
+      COALESCE(redeems.prize_coins_issued, 0) AS prize_coins_issued,
+      COALESCE(redeems.prize_coins_redeemed, 0) AS prize_coins_redeemed,
+      COALESCE(redeems.item_cost_issued_cents, 0) AS item_cost_issued_cents,
+      COALESCE(redeems.item_cost_redeemed_cents, 0) AS item_cost_redeemed_cents
     FROM days
     LEFT JOIN spins   ON spins.d = days.d
     LEFT JOIN redeems ON redeems.d = days.d
@@ -194,18 +236,61 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
     appId, appPublicId, fromTs, toTs
   ).all();
 
-  const days = (rows?.results || []).map(r => ({
-    date: String(r.date || ''),
-    spins: Number(r.spins || 0),
-    spin_cost_coins: Number(r.spin_cost_coins || 0),
-    wins: Number(r.wins || 0),
-    redeemed: Number(r.redeemed || 0),
-  }));
+  const days = (rows?.results || []).map(r => {
+    const spins = Number(r.spins || 0);
+    const spin_cost_coins = Number(r.spin_cost_coins || 0);
 
-  return json({ ok:true, days }, 200, request);
+    const prize_coins_issued = Number(r.prize_coins_issued || 0);
+    const prize_coins_redeemed = Number(r.prize_coins_redeemed || 0);
+
+    const item_cost_issued_cents = Number(r.item_cost_issued_cents || 0);
+    const item_cost_redeemed_cents = Number(r.item_cost_redeemed_cents || 0);
+
+    const revenue_cents = Math.max(0, Math.round(spin_cost_coins * coinValueCents));
+
+    const payout_issued_cents =
+      Math.max(0, Math.round(prize_coins_issued * coinValueCents)) +
+      Math.max(0, Math.round(item_cost_issued_cents));
+
+    const payout_redeemed_cents =
+      Math.max(0, Math.round(prize_coins_redeemed * coinValueCents)) +
+      Math.max(0, Math.round(item_cost_redeemed_cents));
+
+    const profit_issued_cents = revenue_cents - payout_issued_cents;
+    const profit_redeemed_cents = revenue_cents - payout_redeemed_cents;
+
+    return {
+      date: String(r.date || ''),
+      spins,
+      spin_cost_coins,
+      wins: Number(r.wins || 0),
+      redeemed: Number(r.redeemed || 0),
+
+      // NEW: money (cents)
+      revenue_cents,
+      payout_issued_cents,
+      payout_redeemed_cents,
+      profit_issued_cents,
+      profit_redeemed_cents,
+    };
+  });
+
+  // NEW: cumulative profit (cents)
+  let cumIssued = 0;
+  let cumRedeemed = 0;
+  for (const d of days){
+    cumIssued += Number((d as any).profit_issued_cents || 0);
+    cumRedeemed += Number((d as any).profit_redeemed_cents || 0);
+    (d as any).cum_profit_issued_cents = cumIssued;
+    (d as any).cum_profit_redeemed_cents = cumRedeemed;
+  }
+
+  return json({
+    ok: true,
+    settings: { coin_value_cents: coinValueCents, currency: settings.currency },
+    days
+  }, 200, request);
 }
-
-
 
 export async function handleCabinetSummary(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
@@ -424,7 +509,7 @@ export async function handleCabinetOverview(appId, request, env){
   // previous window (same length)
   const fromD = new Date(from+'T00:00:00Z');
   const toD   = new Date(to+'T00:00:00Z');
-  const spanDays = Math.max(1, Math.round((toD - fromD)/(24*3600*1000))+1);
+  const spanDays = Math.max(1, Math.round((toD as any - fromD as any)/(24*3600*1000))+1);
   const prevToD = new Date(fromD.getTime() - 24*3600*1000);
   const prevFromD = new Date(prevToD.getTime() - (spanDays-1)*24*3600*1000);
   const prevFrom = prevFromD.toISOString().slice(0,10);
@@ -511,7 +596,7 @@ export async function handleCabinetOverview(appId, request, env){
   });
 
   function sum(key){
-    return series.reduce((a,p)=>a+Number(p[key]||0),0);
+    return series.reduce((a,p)=>a+Number((p as any)[key]||0),0);
   }
 
   // previous KPI (totals) best-effort
@@ -697,7 +782,7 @@ export async function handleCabinetProfit(appId, request, env){
     const issued_cost = coins_issued * coin_value;
     const redeemed_cost = coins_redeemed * coin_value;
 
-    // liability is "total outstanding" (constant) spread or shown as last known; we show daily same
+    // liability is "total outstanding" (constant)
     const liability_value = outstanding_coins * coin_value;
     const net_profit = gross_profit - redeemed_cost;
 
@@ -713,10 +798,10 @@ export async function handleCabinetProfit(appId, request, env){
     };
   });
 
-  function sum(key){ return series.reduce((a,p)=>a+Number(p[key]||0),0); }
+  function sum(key){ return series.reduce((a,p)=>a+Number((p as any)[key]||0),0); }
 
   const revenue = sum('revenue');
-  const checks = Math.round(sum('revenue') ? (salesRows.results||[]).reduce((a,r)=>a+Number(r.checks||0),0) : (salesRows.results||[]).reduce((a,r)=>a+Number(r.checks||0),0));
+  const checks = (salesRows.results||[]).reduce((a,r)=>a+Number(r.checks||0),0);
   const avg_check = checks ? revenue/checks : 0;
 
   const coinsIssued = (coinRows.results||[]).reduce((a,r)=>a+Number(r.coins_issued||0),0);
