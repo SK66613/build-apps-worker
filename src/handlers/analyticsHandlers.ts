@@ -53,6 +53,12 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
 
   // ВАЖНО: wins считаем по wheel_redeems (это факт выигрыша/выдачи redeem_code)
   // redeemed — по status='redeemed' (подтверждено кассиром)
+  //
+  // ДОБАВЛЕНО:
+  //  - остатки: track_qty / qty_left / stop_when_zero (чтобы кабинет понимал авто-выкл при нуле)
+  //  - (опционально) экономика приза: kind/coins/cost_* если эти колонки есть в wheel_prizes
+  //
+  // ВАЖНО: если в wheel_prizes нет каких-то колонок (kind/cost_*), просто удали их из SELECT ниже.
   const rows = await db.prepare(`
     WITH agg AS (
       SELECT
@@ -70,8 +76,22 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
       p.title AS title,
       COALESCE(a.wins, 0)     AS wins,
       COALESCE(a.redeemed, 0) AS redeemed,
+
       p.weight AS weight,
-      p.active AS active
+      p.active AS active,
+
+      -- ✅ остатки / авто-выкл
+      p.track_qty      AS track_qty,
+      p.qty_left       AS qty_left,
+      p.stop_when_zero AS stop_when_zero,
+
+      -- (опционально) если есть в wheel_prizes
+      p.kind          AS kind,
+      p.coins         AS coins,
+      p.cost_cent     AS cost_cent,
+      p.cost_currency AS cost_currency,
+      p.cost          AS cost
+
     FROM wheel_prizes p
     LEFT JOIN agg a ON a.code = p.code
     WHERE (p.app_id = ? OR p.app_public_id = ?)
@@ -81,17 +101,30 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
     appId, appPublicId
   ).all();
 
-  const items = (rows && rows.results ? rows.results : []).map(r => ({
+  const items = (rows && (rows as any).results ? (rows as any).results : []).map((r: any) => ({
     prize_code: String(r.prize_code || ''),
     title: String(r.title || ''),
     wins: Number(r.wins || 0),
     redeemed: Number(r.redeemed || 0),
     weight: Number(r.weight ?? 0),
     active: Number(r.active ?? 0) ? 1 : 0,
+
+    // ✅ остатки / авто-выкл
+    track_qty: Number(r.track_qty ?? 0) ? 1 : 0,
+    qty_left: (r.qty_left === null || r.qty_left === undefined) ? null : Number(r.qty_left),
+    stop_when_zero: Number(r.stop_when_zero ?? 0) ? 1 : 0,
+
+    // (опционально)
+    kind: r.kind ? String(r.kind) : undefined,
+    coins: (r.coins === null || r.coins === undefined) ? undefined : Number(r.coins),
+    cost_cent: (r.cost_cent === null || r.cost_cent === undefined) ? undefined : Number(r.cost_cent),
+    cost_currency: r.cost_currency ? String(r.cost_currency) : undefined,
+    cost: (r.cost === null || r.cost === undefined) ? undefined : Number(r.cost),
   }));
 
   return json({ ok:true, items }, 200, request);
 }
+
 
 export async function handleCabinetSummary(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
