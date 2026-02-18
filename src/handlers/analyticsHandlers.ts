@@ -803,7 +803,7 @@ export async function handleCabinetWheelPrizesUpdate(appId, request, env, ownerI
     return json({ ok:false, error:'NO_VALID_ITEMS' }, 400, request);
   }
 
-  const appPublicId = await resolveWheelAppPublicId(appId, env);
+  const appPublicId = await getCanonicalPublicIdForApp(appId, env);
   if (!appPublicId){
     return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
   }
