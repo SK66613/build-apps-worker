@@ -15,7 +15,6 @@ function logWheelEvent(event: {
   } catch (_) {}
 }
 
-
 function randomRedeemCodeLocal(len = 10) {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const bytes = crypto.getRandomValues(new Uint8Array(len));
@@ -23,9 +22,6 @@ function randomRedeemCodeLocal(len = 10) {
   for (let i = 0; i < len; i++) s += alphabet[bytes[i] % alphabet.length];
   return "SG-" + s.slice(0, 4) + "-" + s.slice(4, 8) + (len > 8 ? "-" + s.slice(8) : "");
 }
-
-
-
 
 async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number | null> {
   try {
@@ -45,11 +41,23 @@ async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number |
   }
 }
 
+// coin_value_cents (стоимость 1 монеты) — берем снапшотом из app_settings (D1)
+async function getCoinValueCentsFromDb(db: any, appPublicId: string): Promise<number | null> {
+  try {
+    const row: any = await db
+      .prepare(`SELECT coin_value_cents FROM app_settings WHERE app_public_id=? LIMIT 1`)
+      .bind(appPublicId)
+      .first();
 
-
-
-
-
+    const v = Number(row?.coin_value_cents);
+    return Number.isFinite(v) ? Math.max(0, Math.floor(v)) : null;
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (/no such table:\s*app_settings/i.test(msg)) return null;
+    if (/no such column:\s*coin_value_cents/i.test(msg)) return null;
+    return null;
+  }
+}
 
 type PrizeRow = {
   code: string;
@@ -201,25 +209,24 @@ async function reserveOneIfNeeded(db: any, appPublicId: string, prizeCode: strin
   const stop = Number(prRow?.stop_when_zero || 0) === 1;
 
   try {
-    // If stop_when_zero=1 -> require qty_left>0 (and decrement)
-    // If stop_when_zero=0 -> allow even if qty_left<=0, but qty_left will not go negative.
-    const upd = await db.prepare(
-      `UPDATE wheel_prizes
-       SET qty_left = CASE
-         WHEN qty_left IS NULL THEN NULL
-         WHEN qty_left > 0 THEN qty_left - 1
-         ELSE qty_left
-       END
-       WHERE app_public_id=?
-         AND code=?
-         AND track_qty=1
-         AND (
-           ? = 0
-           OR (qty_left IS NOT NULL AND qty_left > 0)
-         )`
-    )
-    .bind(String(appPublicId), String(prizeCode), stop ? 1 : 0)
-    .run();
+    const upd = await db
+      .prepare(
+        `UPDATE wheel_prizes
+         SET qty_left = CASE
+           WHEN qty_left IS NULL THEN NULL
+           WHEN qty_left > 0 THEN qty_left - 1
+           ELSE qty_left
+         END
+         WHERE app_public_id=?
+           AND code=?
+           AND track_qty=1
+           AND (
+             ? = 0
+             OR (qty_left IS NOT NULL AND qty_left > 0)
+           )`
+      )
+      .bind(String(appPublicId), String(prizeCode), stop ? 1 : 0)
+      .run();
 
     return !!upd?.meta?.changes;
   } catch (e: any) {
@@ -229,13 +236,30 @@ async function reserveOneIfNeeded(db: any, appPublicId: string, prizeCode: strin
   }
 }
 
+// ---- WheelArgs (если у тебя этот тип уже импортится в другом месте — можно удалить этот блок)
+export type WheelArgs = {
+  request: Request;
+  env: Env;
+  db: any;
+  type: string;
+  payload: any;
+  tg: any;
+  ctx: { appId: any; publicId: string };
+  buildState: (db: any, appId: any, appPublicId: string, tgId: any, cfg: any) => Promise<any>;
+  spendCoinsIfEnough: (...args: any[]) => Promise<any>;
+  awardCoins: (...args: any[]) => Promise<any>;
+};
 
 export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | null> {
-  const { request, env, db, type, payload, tg, ctx, buildState, spendCoinsIfEnough, awardCoins } = args;
+  const { request, db, type, payload, tg, ctx, buildState, spendCoinsIfEnough, awardCoins } = args;
 
-    // cfg must be defined in function scope (used in multiple branches)
-  let cfg: any = {};
-
+  // cfg нужен в нескольких ветках — реально читаем из payload
+  let cfg: any =
+    (payload as any)?.cfg ??
+    (payload as any)?.config ??
+    (payload as any)?.runtime_config ??
+    (payload as any)?.state ??
+    {};
 
   // ====== wheel.spin (bonus_wheel_one)
   if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
@@ -243,31 +267,39 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     const appPublicId = String((ctx as any).publicId || "");
     const tgUserId = String(tg?.id || "");
 
-// Spin cost: prefer D1 (wheel_prizes.spin_cost), fallback to cfg (KV) if empty/no column
-const spinCostFromDb = await getSpinCostFromDb(db, appPublicId);
-const spinCostFromCfg = Math.max(
-  0,
-  Math.floor(
-    Number(
-      (cfg as any)?.wheel?.spin_cost ??
-      (payload?.spin_cost ?? payload?.spin_cost_coins ?? 0)
-    )
-  )
-);
-const spinCost = (spinCostFromDb !== null) ? spinCostFromDb : spinCostFromCfg;
+    // Spin cost: prefer D1 (wheel_prizes.spin_cost), fallback to cfg (KV) if empty/no column
+    const spinCostFromDb = await getSpinCostFromDb(db, appPublicId);
+    const spinCostFromCfg = Math.max(
+      0,
+      Math.floor(Number((cfg as any)?.wheel?.spin_cost ?? (payload?.spin_cost ?? payload?.spin_cost_coins ?? 0)))
+    );
+    const spinCost = spinCostFromDb !== null ? spinCostFromDb : spinCostFromCfg;
 
-
+    // coin value cents (snapshot): prefer app_settings (D1), fallback cfg
+    const coinValueCentsFromDb = await getCoinValueCentsFromDb(db, appPublicId);
+    const coinValueCentsFromCfg = Math.max(
+      0,
+      Math.floor(
+        Number(
+          (cfg as any)?.app_settings?.coin_value_cents ??
+            (cfg as any)?.coins?.coin_value_cents ??
+            (cfg as any)?.coins?.value_cents ??
+            0
+        )
+      )
+    );
+    const coinValueCents = coinValueCentsFromDb !== null ? coinValueCentsFromDb : coinValueCentsFromCfg;
 
     // 1) create spin row (status new)
     let ins: any;
     try {
-ins = await db
-  .prepare(
-    `INSERT INTO wheel_spins (app_id, app_public_id, tg_id, status, prize_code, prize_title, spin_cost, prize_coins)
-     VALUES (?, ?, ?, 'new', '', '', ?, 0)`
-  )
-  .bind((ctx as any).appId, appPublicId, tgUserId, spinCost)
-  .run();
+      ins = await db
+        .prepare(
+          `INSERT INTO wheel_spins (app_id, app_public_id, tg_id, status, prize_code, prize_title, spin_cost, prize_coins)
+           VALUES (?, ?, ?, 'new', '', '', ?, 0)`
+        )
+        .bind((ctx as any).appId, appPublicId, tgUserId, spinCost)
+        .run();
     } catch (e: any) {
       logWheelEvent({
         code: "mini.wheel.spin.fail.db_error",
@@ -392,7 +424,6 @@ ins = await db
       if (!picked) break;
 
       prDetails = await getWheelPrizeDetails(db, appPublicId, String(picked.code || ""));
-
       const okReserve = await reserveOneIfNeeded(db, appPublicId, String(picked.code || ""), prDetails);
       if (!okReserve) {
         prize = null;
@@ -434,183 +465,213 @@ ins = await db
       return json({ ok: false, error: "NO_AVAILABLE_PRIZES" }, 409, request);
     }
 
-const prizeCoins = Math.max(0, Math.floor(Number(prDetails?.coins ?? prize.coins ?? 0)));
-const prizeImg = String((prDetails?.img ?? prize.img ?? "") || "");
+    const prizeCoins = Math.max(0, Math.floor(Number(prDetails?.coins ?? prize.coins ?? 0)));
+    const prizeImg = String((prDetails?.img ?? prize.img ?? "") || "");
 
-// kind: auto-award coins ONLY when kind explicitly "coins"
-const kindRaw = String((prDetails?.kind ?? prize.kind ?? "") || "").trim().toLowerCase();
-const kind = (kindRaw === "coins") ? "coins" : "item";
+    // kind: auto-award coins ONLY when kind explicitly "coins"
+    const kindRaw = String((prDetails?.kind ?? prize.kind ?? "") || "").trim().toLowerCase();
+    const kind = kindRaw === "coins" ? "coins" : "item";
 
+    // ===== snapshots for wheel_spins analytics =====
+    const prizeKind = String(kind || "item");
 
+    // себестоимость вещи (только для item). Для coins можно оставить 0, чтобы не путать.
+    const prizeCostCent =
+      prizeKind === "coins"
+        ? 0
+        : Math.max(0, Math.floor(Number(prDetails?.cost_cent ?? (prize as any).cost_cent ?? 0)));
 
+    const prizeCostCurrencyRaw = prDetails?.cost_currency ?? (prize as any).cost_currency ?? "RUB";
+    const prizeCostCurrency = prizeCostCurrencyRaw ? String(prizeCostCurrencyRaw) : "RUB";
 
-
-
-// ==== COINS PRIZE → instant award (no redeem row) ====
-if (kind === "coins" && prizeCoins > 0) {
-  const res: any = await awardCoins(
-    db,
-    (ctx as any).appId,
-    appPublicId,
-    tg.id,
-    prizeCoins,
-    "wheel_prize_coins",
-    String(spinId),
-    String(prize.title || "Wheel coins"),
-    `wheel:prize:${appPublicId}:${tg.id}:${spinId}:${prizeCoins}`
-  );
-
-  if (!res?.ok) {
-    if (spinCost > 0) {
-      await awardCoins(
+    // ==== COINS PRIZE → instant award (no redeem row) ====
+    if (kind === "coins" && prizeCoins > 0) {
+      const res: any = await awardCoins(
         db,
         (ctx as any).appId,
         appPublicId,
         tg.id,
-        spinCost,
-        "wheel_refund",
+        prizeCoins,
+        "wheel_prize_coins",
         String(spinId),
-        "Refund: coins prize award failed",
-        `wheel:refund:${appPublicId}:${tg.id}:${spinId}`
-      ).catch(() => null);
+        String(prize.title || "Wheel coins"),
+        `wheel:prize:${appPublicId}:${tg.id}:${spinId}:${prizeCoins}`
+      );
+
+      if (!res?.ok) {
+        if (spinCost > 0) {
+          await awardCoins(
+            db,
+            (ctx as any).appId,
+            appPublicId,
+            tg.id,
+            spinCost,
+            "wheel_refund",
+            String(spinId),
+            "Refund: coins prize award failed",
+            `wheel:refund:${appPublicId}:${tg.id}:${spinId}`
+          ).catch(() => null);
+        }
+        await db.prepare(`DELETE FROM wheel_spins WHERE id=?`).bind(spinId).run().catch(() => null);
+
+        logWheelEvent({
+          code: "mini.wheel.spin.fail.award_coins_failed",
+          msg: "Failed to award coins prize",
+          appPublicId,
+          tgUserId,
+          route,
+          extra: { spinId, err: res?.error || res?.msg || "unknown" },
+        });
+
+        return json({ ok: false, error: "AWARD_COINS_FAILED" }, 500, request);
+      }
+
+      await db
+        .prepare(
+          `UPDATE wheel_spins
+           SET status='redeemed',
+               prize_code=?,
+               prize_title=?,
+               prize_coins=?,
+               spin_cost=?,
+
+               prize_kind=?,
+               prize_cost_cent=?,
+               prize_cost_currency=?,
+               coin_value_cents=?,
+
+               ts_issued=datetime('now'),
+               ts_redeemed=datetime('now'),
+               redeemed_by_tg=?
+           WHERE id=?`
+        )
+        .bind(
+          String(prize.code || ""),
+          String(prize.title || ""),
+          prizeCoins,
+          spinCost,
+
+          prizeKind,
+          prizeCostCent,
+          prizeCostCurrency,
+          coinValueCents,
+
+          String(tgUserId),
+          spinId
+        )
+        .run()
+        .catch(async () => {
+          // fallback for older schema
+          await db
+            .prepare(
+              `UPDATE wheel_spins
+               SET status='redeemed',
+                   prize_code=?,
+                   prize_title=?,
+                   prize_coins=?,
+                   spin_cost=?,
+                   ts_issued=datetime('now'),
+                   ts_redeemed=datetime('now'),
+                   redeemed_by_tg=?
+               WHERE id=?`
+            )
+            .bind(
+              String(prize.code || ""),
+              String(prize.title || ""),
+              prizeCoins,
+              spinCost,
+              String(tgUserId),
+              spinId
+            )
+            .run()
+            .catch(() => null);
+        });
+
+      const fresh_state = await buildState(db, (ctx as any).appId, appPublicId, tg.id, cfg);
+
+      return json(
+        {
+          ok: true,
+          prize: { code: prize.code || "", title: prize.title || "", coins: prizeCoins, img: prizeImg || "" },
+          spin_cost: spinCost,
+          spin_id: spinId,
+          rewards_count: 0,
+          fresh_state,
+          auto_awarded: true,
+        },
+        200,
+        request
+      );
     }
-    await db.prepare(`DELETE FROM wheel_spins WHERE id=?`).bind(spinId).run().catch(() => null);
 
-    logWheelEvent({
-      code: "mini.wheel.spin.fail.award_coins_failed",
-      msg: "Failed to award coins prize",
-      appPublicId,
-      tgUserId,
-      route,
-      extra: { spinId, err: res?.error || res?.msg || "unknown" },
-    });
-
-    return json({ ok: false, error: "AWARD_COINS_FAILED" }, 500, request);
-  }
-
-await db.prepare(
-  `UPDATE wheel_spins
-   SET status='redeemed',
-       prize_code=?,
-       prize_title=?,
-       prize_coins=?,
-       ts_issued=datetime('now'),
-       ts_redeemed=datetime('now'),
-       redeemed_by_tg=?
-   WHERE id=?`
-)
-.bind(String(prize.code || ""), String(prize.title || ""), prizeCoins, String(tgUserId), spinId)
-.run()
-.catch(async () => {
-  // fallback for older schema without prize_coins
-  await db.prepare(
-    `UPDATE wheel_spins
-     SET status='redeemed',
-         prize_code=?,
-         prize_title=?,
-         ts_issued=datetime('now'),
-         ts_redeemed=datetime('now'),
-         redeemed_by_tg=?
-     WHERE id=?`
-  ).bind(String(prize.code || ""), String(prize.title || ""), String(tgUserId), spinId).run().catch(() => null);
-});
-
-
-  const fresh_state = await buildState(db, (ctx as any).appId, appPublicId, tg.id, cfg);
-
-  return json(
-    {
-      ok: true,
-      prize: { code: prize.code || "", title: prize.title || "", coins: prizeCoins, img: prizeImg || "" },
-      spin_cost: spinCost,
-      spin_id: spinId,
-      rewards_count: 0,
-      fresh_state,
-      auto_awarded: true,
-    },
-    200,
-    request
-  );
-}
-
-    
-
-// ===== cost calc (for analytics / profit) =====
-const coinCostCent = Math.max(
-  0,
-  Math.floor(
-    Number(
-      (cfg as any)?.coins?.cost_cent_per_coin ??
-      (cfg as any)?.wheel?.coin_cost_cent ??
-      0
-    )
-  )
-);
-
-const costCent =
-  kind === "coins"
-    ? prizeCoins * coinCostCent
-    : Math.max(0, Math.floor(Number(prDetails?.cost_cent ?? prize.cost_cent ?? 0)));
-
-const costCurrencyRaw = prDetails?.cost_currency ?? prize.cost_currency ?? "RUB";
-const costCurrency = costCurrencyRaw ? String(costCurrencyRaw) : null;
-
-// ===== 5) issue redeem (wheel_redeems) =====
-// ВАЖНО: пишем kind + coins прямо в wheel_redeems
-let redeem: any = null;
-for (let i = 0; i < 5; i++) {
-  const redeemCode = randomRedeemCodeLocal(10);
-  try {
-    const ins2 = await db
-      .prepare(
-        `INSERT INTO wheel_redeems
-           (app_id, app_public_id, tg_id, spin_id, prize_code, prize_title,
-            redeem_code, status, issued_at, img, expires_at,
-            kind, coins,
-            cost_cent, cost_currency)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?, NULL, ?, ?, ?, ?)`
+    // ===== cost calc (for analytics / profit) =====
+    const coinCostCent = Math.max(
+      0,
+      Math.floor(
+        Number((cfg as any)?.coins?.cost_cent_per_coin ?? (cfg as any)?.wheel?.coin_cost_cent ?? 0)
       )
-      .bind(
-        (ctx as any).appId,
-        appPublicId,
-        tgUserId,
-        spinId,
-        String(prize.code || ""),
-        String(prize.title || ""),
-        redeemCode,
-        prizeImg,
+    );
 
-        // NEW:
-        String(kind || "item"),
-        Number.isFinite(Number(prizeCoins)) ? Math.max(0, Math.floor(Number(prizeCoins))) : 0,
+    const costCent =
+      kind === "coins"
+        ? prizeCoins * coinCostCent
+        : Math.max(0, Math.floor(Number(prDetails?.cost_cent ?? (prize as any).cost_cent ?? 0)));
 
-        // existing:
-        costCent,
-        costCurrency
-      )
-      .run();
+    const costCurrencyRaw = prDetails?.cost_currency ?? (prize as any).cost_currency ?? "RUB";
+    const costCurrency = costCurrencyRaw ? String(costCurrencyRaw) : null;
 
-    redeem = {
-      id: Number((ins2 as any)?.meta?.last_row_id || (ins2 as any)?.lastInsertRowid || 0),
-      redeem_code: redeemCode,
-    };
-    break;
-  } catch (e: any) {
-    const msg = String(e?.message || e);
-    if (!/unique|constraint/i.test(msg)) {
-      logWheelEvent({
-        code: "mini.wheel.spin.fail.db_error",
-        msg: "Failed to issue reward",
-        appPublicId,
-        tgUserId,
-        route,
-        extra: { spinId, error: msg },
-      });
-      return json({ ok: false, error: "REDEEM_CREATE_FAILED" }, 500, request);
+    // ===== 5) issue redeem (wheel_redeems) =====
+    let redeem: any = null;
+    for (let i = 0; i < 5; i++) {
+      const redeemCode = randomRedeemCodeLocal(10);
+      try {
+        const ins2 = await db
+          .prepare(
+            `INSERT INTO wheel_redeems
+               (app_id, app_public_id, tg_id, spin_id, prize_code, prize_title,
+                redeem_code, status, issued_at, img, expires_at,
+                kind, coins,
+                cost_cent, cost_currency)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?, NULL, ?, ?, ?, ?)`
+          )
+          .bind(
+            (ctx as any).appId,
+            appPublicId,
+            tgUserId,
+            spinId,
+            String(prize.code || ""),
+            String(prize.title || ""),
+            redeemCode,
+            prizeImg,
+
+            String(kind || "item"),
+            Number.isFinite(Number(prizeCoins)) ? Math.max(0, Math.floor(Number(prizeCoins))) : 0,
+
+            costCent,
+            costCurrency
+          )
+          .run();
+
+        redeem = {
+          id: Number((ins2 as any)?.meta?.last_row_id || (ins2 as any)?.lastInsertRowid || 0),
+          redeem_code: redeemCode,
+        };
+        break;
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        if (!/unique|constraint/i.test(msg)) {
+          logWheelEvent({
+            code: "mini.wheel.spin.fail.db_error",
+            msg: "Failed to issue reward",
+            appPublicId,
+            tgUserId,
+            route,
+            extra: { spinId, error: msg },
+          });
+          return json({ ok: false, error: "REDEEM_CREATE_FAILED" }, 500, request);
+        }
+      }
     }
-  }
-}
-
 
     if (!redeem?.id) {
       logWheelEvent({
@@ -624,42 +685,66 @@ for (let i = 0; i < 5; i++) {
       return json({ ok: false, error: "REDEEM_CREATE_FAILED" }, 500, request);
     }
 
-    // 6) update spin status -> issued
-try {
-  await db
-    .prepare(
-      `UPDATE wheel_spins
-       SET status='issued',
-           prize_code=?,
-           prize_title=?,
-           prize_coins=?,
-           redeem_id=?,
-           ts_issued=datetime('now')
-       WHERE id=?`
-    )
-    .bind(String(prize.code || ""), String(prize.title || ""), prizeCoins, Number(redeem.id), spinId)
-    .run();
-} catch (e: any) {
-  const msg = String(e?.message || e);
-  // fallback for older schema without prize_coins
-  if (/no such column:\s*prize_coins/i.test(msg)) {
-    await db
-      .prepare(
-        `UPDATE wheel_spins
-         SET status='issued',
-             prize_code=?,
-             prize_title=?,
-             redeem_id=?,
-             ts_issued=datetime('now')
-         WHERE id=?`
-      )
-      .bind(String(prize.code || ""), String(prize.title || ""), Number(redeem.id), spinId)
-      .run();
-  } else {
-    throw e;
-  }
-}
+    // 6) update spin status -> issued (with snapshots)
+    try {
+      await db
+        .prepare(
+          `UPDATE wheel_spins
+           SET status='issued',
+               prize_code=?,
+               prize_title=?,
+               prize_coins=?,
+               spin_cost=?,
+               redeem_id=?,
 
+               prize_kind=?,
+               prize_cost_cent=?,
+               prize_cost_currency=?,
+               coin_value_cents=?,
+
+               ts_issued=datetime('now')
+           WHERE id=?`
+        )
+        .bind(
+          String(prize.code || ""),
+          String(prize.title || ""),
+          prizeCoins,
+          spinCost,
+          Number(redeem.id),
+
+          prizeKind,
+          prizeCostCent,
+          prizeCostCurrency,
+          coinValueCents,
+
+          spinId
+        )
+        .run();
+    } catch (e: any) {
+      // fallback for older schema
+      await db
+        .prepare(
+          `UPDATE wheel_spins
+           SET status='issued',
+               prize_code=?,
+               prize_title=?,
+               prize_coins=?,
+               spin_cost=?,
+               redeem_id=?,
+               ts_issued=datetime('now')
+           WHERE id=?`
+        )
+        .bind(
+          String(prize.code || ""),
+          String(prize.title || ""),
+          prizeCoins,
+          spinCost,
+          Number(redeem.id),
+          spinId
+        )
+        .run()
+        .catch(() => null);
+    }
 
     // 7) count issued rewards
     let rewardsCountRow: any;
