@@ -20,6 +20,9 @@ import {
   getDialogMessages,
   sendDialogMessage,
 } from "../handlers/cabinetApiHandlers";
+
+import { handleGetAppSettings, handleSetAppSettings } from "../handlers/appSettingsHandlers";
+
 import { json } from "../utils/http";
 
 export async function routeCabinet(request: Request, env: Env, url: URL): Promise<Response | null> {
@@ -106,6 +109,46 @@ export async function routeCabinet(request: Request, env: Env, url: URL): Promis
     return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
   }
 
+
+
+
+
+
+
+  // ===== app settings =====
+  // GET /api/app/:id/settings
+  // PUT /api/app/:id/settings
+  const mSettings = p.match(/^\/api\/app\/([^/]+)\/settings$/);
+  if (mSettings) {
+    const appId = decodeURIComponent(mSettings[1]);
+    const s = await requireSession(request as any, env as any);
+    if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
+
+    const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
+
+    // важное: settings храним по app_public_id
+    // твой canonical publicId = appId (везде так используешь) — оставляем так же
+    const appPublicId = appId;
+
+    if (request.method === "GET") {
+      return handleGetAppSettings(env, appPublicId, request);
+    }
+
+    if (request.method === "PUT") {
+      const body = await request.json().catch(() => ({}));
+      return handleSetAppSettings(env, appPublicId, body, request);
+    }
+
+    return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
+  }
+
+
+
+
+
+  
   // ===== publish =====
   const mPub = p.match(/^\/api\/app\/([^/]+)\/publish$/);
   if (mPub && request.method === "POST") {
