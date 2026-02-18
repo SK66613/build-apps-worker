@@ -21,12 +21,108 @@ import {
   sendDialogMessage,
 } from "../handlers/cabinetApiHandlers";
 
-import { handleGetAppSettings, handleSetAppSettings } from "../handlers/appSettingsHandlers";
-
 import { json } from "../utils/http";
+import { getCanonicalPublicIdForApp } from "../services/apps";
+
+// analytics endpoints (wheel)
+import {
+  handleCabinetWheelStats,
+  handleCabinetWheelTimeseries,
+  handleCabinetWheelPrizesGet,
+  handleCabinetWheelPrizesUpdate,
+} from "../handlers/analyticsHandlers";
+
+// app settings (coin value etc.)
+import { handleGetAppSettings, handleSetAppSettings } from "../handlers/appSettingsHandlers";
 
 export async function routeCabinet(request: Request, env: Env, url: URL): Promise<Response | null> {
   const p = url.pathname;
+
+  // ===============================
+  // CABINET V2 ROUTES (/api/cabinet/apps/*)
+  // ===============================
+  // NOTE: фронт (React cabinet) ходит сюда.
+  // Тут обязательно проверяем сессию и владение.
+
+  // --- wheel stats: GET /api/cabinet/apps/:id/wheel/stats?from=YYYY-MM-DD&to=YYYY-MM-DD
+  const mCabWheelStats = p.match(/^\/api\/cabinet\/apps\/([^/]+)\/wheel\/stats$/);
+  if (mCabWheelStats && request.method === "GET") {
+    const appId = decodeURIComponent(mCabWheelStats[1]);
+
+    const s = await requireSession(request as any, env as any);
+    if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
+
+    const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status || 403, request);
+
+    return handleCabinetWheelStats(appId, request as any, env as any, s.uid);
+  }
+
+  // --- wheel timeseries: GET /api/cabinet/apps/:id/wheel/timeseries?from=...&to=...
+  const mCabWheelTs = p.match(/^\/api\/cabinet\/apps\/([^/]+)\/wheel\/timeseries$/);
+  if (mCabWheelTs && request.method === "GET") {
+    const appId = decodeURIComponent(mCabWheelTs[1]);
+
+    const s = await requireSession(request as any, env as any);
+    if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
+
+    const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status || 403, request);
+
+    return handleCabinetWheelTimeseries(appId, request as any, env as any, s.uid);
+  }
+
+  // --- wheel prizes: GET/PUT /api/cabinet/apps/:id/wheel/prizes
+  const mCabWheelPrizes = p.match(/^\/api\/cabinet\/apps\/([^/]+)\/wheel\/prizes$/);
+  if (mCabWheelPrizes) {
+    const appId = decodeURIComponent(mCabWheelPrizes[1]);
+
+    const s = await requireSession(request as any, env as any);
+    if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
+
+    const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status || 403, request);
+
+    if (request.method === "GET") return handleCabinetWheelPrizesGet(appId, request as any, env as any, s.uid);
+    if (request.method === "PUT") return handleCabinetWheelPrizesUpdate(appId, request as any, env as any, s.uid);
+
+    return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
+  }
+
+  // --- app settings: GET/PUT /api/cabinet/apps/:id/settings
+  // Сейчас нам нужно: coin_value_cents (сколько рублей стоит 1 монета)
+  const mCabSettings = p.match(/^\/api\/cabinet\/apps\/([^/]+)\/settings$/);
+  if (mCabSettings) {
+    const appId = decodeURIComponent(mCabSettings[1]);
+
+    const s = await requireSession(request as any, env as any);
+    if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
+
+    const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
+    if (!ownerCheck.ok)
+      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status || 403, request);
+
+    const appPublicId = await getCanonicalPublicIdForApp(appId, env as any);
+    if (!appPublicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 404, request);
+
+    if (request.method === "GET") {
+      return handleGetAppSettings(env as any, appPublicId as any);
+    }
+
+    if (request.method === "PUT") {
+      const body = await request.json().catch(() => ({}));
+      return handleSetAppSettings(env as any, appPublicId as any, body);
+    }
+
+    return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
+  }
+
+  // ===============================
+  // LEGACY ROUTES (/api/app/*)
+  // ===============================
 
   // ===== constructor blueprint config (DRAFT KV) =====
   // GET/PUT /api/app/:id/config
@@ -76,7 +172,6 @@ export async function routeCabinet(request: Request, env: Env, url: URL): Promis
     return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
   }
 
-
   // ===== apps list =====
   if ((p === "/api/my/apps" || p === "/api/apps") && request.method === "GET") {
     const s = await requireSession(request as any, env as any);
@@ -109,46 +204,6 @@ export async function routeCabinet(request: Request, env: Env, url: URL): Promis
     return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
   }
 
-
-
-
-
-
-
-  // ===== app settings =====
-  // GET /api/app/:id/settings
-  // PUT /api/app/:id/settings
-  const mSettings = p.match(/^\/api\/app\/([^/]+)\/settings$/);
-  if (mSettings) {
-    const appId = decodeURIComponent(mSettings[1]);
-    const s = await requireSession(request as any, env as any);
-    if (!s) return json({ ok: false, error: "UNAUTHORIZED" }, 401, request);
-
-    const ownerCheck = await ensureAppOwner(appId, s.uid, env as any);
-    if (!ownerCheck.ok)
-      return json({ ok: false, error: "FORBIDDEN" }, ownerCheck.status, request);
-
-    // важное: settings храним по app_public_id
-    // твой canonical publicId = appId (везде так используешь) — оставляем так же
-    const appPublicId = appId;
-
-    if (request.method === "GET") {
-      return handleGetAppSettings(env, appPublicId, request);
-    }
-
-    if (request.method === "PUT") {
-      const body = await request.json().catch(() => ({}));
-      return handleSetAppSettings(env, appPublicId, body, request);
-    }
-
-    return json({ ok: false, error: "METHOD_NOT_ALLOWED" }, 405, request);
-  }
-
-
-
-
-
-  
   // ===== publish =====
   const mPub = p.match(/^\/api\/app\/([^/]+)\/publish$/);
   if (mPub && request.method === "POST") {
