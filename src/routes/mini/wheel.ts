@@ -25,6 +25,7 @@ function randomRedeemCodeLocal(len = 10) {
 
 
 
+
 async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number | null> {
   try {
     // берём стабильное значение даже если вдруг где-то рассинк: MAX()
