@@ -55,6 +55,11 @@ async function getAppSettingsForPublicId(env: Env, appPublicId: string){
   }
 }
 
+/**
+ * CABINET: WHEEL STATS (PRIZE TABLE)
+ * ✅ Facts (wins/redeemed) from wheel_spins (history)
+ * ✅ Prize settings/stock from wheel_prizes (current config)
+ */
 export async function handleCabinetWheelStats(appId, request, env, ownerId){
   const url = new URL(request.url);
 
@@ -80,12 +85,12 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
     WITH agg AS (
       SELECT
         prize_code AS code,
-        COUNT(*) AS wins,
-        SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
-      FROM wheel_redeems
+        SUM(CASE WHEN ts_issued IS NOT NULL THEN 1 ELSE 0 END)   AS wins,
+        SUM(CASE WHEN ts_redeemed IS NOT NULL THEN 1 ELSE 0 END) AS redeemed
+      FROM wheel_spins
       WHERE (app_id = ? OR app_public_id = ?)
-        AND issued_at >= ?
-        AND issued_at < ?
+        AND ts_created >= ?
+        AND ts_created < ?
       GROUP BY prize_code
     )
     SELECT
@@ -140,6 +145,15 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
   return json({ ok:true, items }, 200, request);
 }
 
+/**
+ * CABINET: WHEEL TIMESERIES (DAILY)
+ * ✅ ONLY wheel_spins snapshots — no recalculation via app_settings / wheel_prizes
+ * Expects wheel_spins has:
+ *   ts_created, ts_issued, ts_redeemed,
+ *   spin_cost, coin_value_cents,
+ *   prize_kind, prize_coins,
+ *   prize_cost
+ */
 export async function handleCabinetWheelTimeseries(appId, request, env, ownerId){
   const url = new URL(request.url);
 
@@ -159,135 +173,72 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
     return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
   }
 
-  const settings = await getAppSettingsForPublicId(env, appPublicId);
-  const coinValueCents = settings.coin_value_cents;
-
   const db = env.DB;
 
-  // NOTE: даты берём через substr('YYYY-MM-DD HH:MM:SS', 1, 10)
-  // tz сейчас игнорируем (как у тебя хранится без TZ). Потом можно аккуратно расширить.
   const rows = await db.prepare(`
-    WITH spins AS (
-      SELECT
-        substr(ts_created, 1, 10) AS d,
-        COUNT(*) AS spins,
-        COALESCE(SUM(COALESCE(spin_cost, 0)), 0) AS spin_cost_coins
-      FROM wheel_spins
-      WHERE (app_id = ? OR app_public_id = ?)
-        AND ts_created >= ?
-        AND ts_created < ?
-      GROUP BY substr(ts_created, 1, 10)
-    ),
-    redeems AS (
-      SELECT
-        substr(issued_at, 1, 10) AS d,
-        COUNT(*) AS wins,
-        SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed,
-
-        -- coin prizes cost (issued)
-        COALESCE(SUM(
-          CASE WHEN kind='coins' THEN COALESCE(coins,0) ELSE 0 END
-        ),0) AS prize_coins_issued,
-
-        -- coin prizes cost (redeemed)
-        COALESCE(SUM(
-          CASE WHEN status='redeemed' AND kind='coins' THEN COALESCE(coins,0) ELSE 0 END
-        ),0) AS prize_coins_redeemed,
-
-        -- item prizes cost (issued) in cents
-        COALESCE(SUM(
-          CASE WHEN kind!='coins' THEN COALESCE(cost_cent,0) ELSE 0 END
-        ),0) AS item_cost_issued_cents,
-
-        -- item prizes cost (redeemed) in cents
-        COALESCE(SUM(
-          CASE WHEN status='redeemed' AND kind!='coins' THEN COALESCE(cost_cent,0) ELSE 0 END
-        ),0) AS item_cost_redeemed_cents
-      FROM wheel_redeems
-      WHERE (app_id = ? OR app_public_id = ?)
-        AND issued_at >= ?
-        AND issued_at < ?
-      GROUP BY substr(issued_at, 1, 10)
-    ),
-    days AS (
-      SELECT d FROM spins
-      UNION
-      SELECT d FROM redeems
-    )
     SELECT
-      days.d AS date,
+      substr(ts_created, 1, 10) AS date,
 
-      COALESCE(spins.spins, 0) AS spins,
-      COALESCE(spins.spin_cost_coins, 0) AS spin_cost_coins,
+      COUNT(*) AS spins,
+      SUM(CASE WHEN ts_issued   IS NOT NULL THEN 1 ELSE 0 END) AS wins,
+      SUM(CASE WHEN ts_redeemed IS NOT NULL THEN 1 ELSE 0 END) AS redeemed,
 
-      COALESCE(redeems.wins, 0) AS wins,
-      COALESCE(redeems.redeemed, 0) AS redeemed,
+      -- revenue snapshot per spin
+      COALESCE(SUM(COALESCE(spin_cost,0) * COALESCE(coin_value_cents,0)), 0) AS revenue_cents,
 
-      COALESCE(redeems.prize_coins_issued, 0) AS prize_coins_issued,
-      COALESCE(redeems.prize_coins_redeemed, 0) AS prize_coins_redeemed,
-      COALESCE(redeems.item_cost_issued_cents, 0) AS item_cost_issued_cents,
-      COALESCE(redeems.item_cost_redeemed_cents, 0) AS item_cost_redeemed_cents
-    FROM days
-    LEFT JOIN spins   ON spins.d = days.d
-    LEFT JOIN redeems ON redeems.d = days.d
-    ORDER BY days.d ASC
+      -- payout at "issued moment" (only for wins)
+      COALESCE(SUM(
+        CASE
+          WHEN ts_issued IS NULL THEN 0
+          WHEN prize_kind = 'coins' THEN COALESCE(prize_coins,0) * COALESCE(coin_value_cents,0)
+          ELSE COALESCE(prize_cost,0)
+        END
+      ), 0) AS payout_issued_cents,
+
+      -- payout at "redeemed moment" (only for redeemed)
+      COALESCE(SUM(
+        CASE
+          WHEN ts_redeemed IS NULL THEN 0
+          WHEN prize_kind = 'coins' THEN COALESCE(prize_coins,0) * COALESCE(coin_value_cents,0)
+          ELSE COALESCE(prize_cost,0)
+        END
+      ), 0) AS payout_redeemed_cents
+
+    FROM wheel_spins
+    WHERE (app_id = ? OR app_public_id = ?)
+      AND ts_created >= ?
+      AND ts_created < ?
+    GROUP BY substr(ts_created, 1, 10)
+    ORDER BY date ASC
   `).bind(
-    appId, appPublicId, fromTs, toTs,
     appId, appPublicId, fromTs, toTs
   ).all();
 
   const days = (rows?.results || []).map(r => {
-    const spins = Number(r.spins || 0);
-    const spin_cost_coins = Number(r.spin_cost_coins || 0);
-
-    const prize_coins_issued = Number(r.prize_coins_issued || 0);
-    const prize_coins_redeemed = Number(r.prize_coins_redeemed || 0);
-
-    const item_cost_issued_cents = Number(r.item_cost_issued_cents || 0);
-    const item_cost_redeemed_cents = Number(r.item_cost_redeemed_cents || 0);
-
-    const revenue_cents = Math.max(0, Math.round(spin_cost_coins * coinValueCents));
-
-    const payout_issued_cents =
-      Math.max(0, Math.round(prize_coins_issued * coinValueCents)) +
-      Math.max(0, Math.round(item_cost_issued_cents));
-
-    const payout_redeemed_cents =
-      Math.max(0, Math.round(prize_coins_redeemed * coinValueCents)) +
-      Math.max(0, Math.round(item_cost_redeemed_cents));
-
-    const profit_issued_cents = revenue_cents - payout_issued_cents;
-    const profit_redeemed_cents = revenue_cents - payout_redeemed_cents;
+    const revenue_cents = Number(r.revenue_cents || 0);
+    const payout_issued_cents = Number(r.payout_issued_cents || 0);
+    const payout_redeemed_cents = Number(r.payout_redeemed_cents || 0);
 
     return {
       date: String(r.date || ''),
-      spins,
-      spin_cost_coins,
+      spins: Number(r.spins || 0),
       wins: Number(r.wins || 0),
       redeemed: Number(r.redeemed || 0),
 
-      // NEW: money (cents)
       revenue_cents,
       payout_issued_cents,
       payout_redeemed_cents,
-      profit_issued_cents,
-      profit_redeemed_cents,
+      profit_issued_cents: revenue_cents - payout_issued_cents,
+      profit_redeemed_cents: revenue_cents - payout_redeemed_cents,
     };
   });
 
-  // NEW: cumulative profit (cents)
-  let cumIssued = 0;
-  let cumRedeemed = 0;
-  for (const d of days){
-    cumIssued += Number((d as any).profit_issued_cents || 0);
-    cumRedeemed += Number((d as any).profit_redeemed_cents || 0);
-    (d as any).cum_profit_issued_cents = cumIssued;
-    (d as any).cum_profit_redeemed_cents = cumRedeemed;
-  }
+  // optional: keep returning settings for back-compat / UI display (NOT used in calculations anymore)
+  const settings = await getAppSettingsForPublicId(env, appPublicId);
 
   return json({
     ok: true,
-    settings: { coin_value_cents: coinValueCents, currency: settings.currency },
+    settings: { coin_value_cents: settings.coin_value_cents, currency: settings.currency },
     days
   }, 200, request);
 }
@@ -681,15 +632,16 @@ export async function handleCabinetOverview(appId, request, env){
     sub: `${Number(r.sales_count||0)} checks`,
   }));
 
-  // top prizes: by wins/redeemed (best-effort from wheel_redeems)
+  // ✅ top prizes: by wins/redeemed from wheel_spins (history)
   const topPrizeRows = await safeAll(`
-    SELECT prize_code AS prize_code,
-           COALESCE(MAX(prize_title), prize_code) AS title,
-           COUNT(1) AS wins,
-           SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
-    FROM wheel_redeems
+    SELECT
+      prize_code AS prize_code,
+      COALESCE(MAX(prize_title), prize_code) AS title,
+      SUM(CASE WHEN ts_issued IS NOT NULL THEN 1 ELSE 0 END)   AS wins,
+      SUM(CASE WHEN ts_redeemed IS NOT NULL THEN 1 ELSE 0 END) AS redeemed
+    FROM wheel_spins
     WHERE app_public_id = ?
-      AND date(created_at) BETWEEN date(?) AND date(?)
+      AND date(ts_created) BETWEEN date(?) AND date(?)
     GROUP BY prize_code
     ORDER BY wins DESC
     LIMIT 7
