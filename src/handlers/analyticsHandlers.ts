@@ -27,22 +27,26 @@ const json = (obj: any, status = 200, request: Request | null = null) => jsonRes
 export async function handleCabinetWheelStats(appId, request, env, ownerId){
   const url = new URL(request.url);
 
-  // from/to как в React: YYYY-MM-DD
   const from = String(url.searchParams.get('from') || '').trim();
   const to   = String(url.searchParams.get('to') || '').trim();
 
-  // Фоллбек если не передали
   const fromOk = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : null;
   const toOk   = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : null;
 
-  // toExclusive = to + 1 day
+  function addDaysIso(iso, delta){
+    const d = new Date(iso + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + delta);
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth()+1).padStart(2,'0');
+    const day = String(d.getUTCDate()).padStart(2,'0');
+    return `${y}-${m}-${day}`;
+  }
+
   const toPlus1 = toOk ? addDaysIso(toOk, 1) : null;
 
-  // диапазон в формате datetime (как у тебя хранится issued_at: 'YYYY-MM-DD HH:MM:SS')
   const fromTs = fromOk ? `${fromOk} 00:00:00` : '1970-01-01 00:00:00';
   const toTs   = (toPlus1 ? `${toPlus1} 00:00:00` : '2999-12-31 00:00:00');
 
-  // канонический public_id нужен для wheel_prizes
   const appPublicId = await getCanonicalPublicIdForApp(appId, env);
   if (!appPublicId) {
     return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
@@ -50,8 +54,6 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
 
   const db = env.DB;
 
-  // wins считаем по wheel_redeems (факт выигрыша / выдачи redeem_code)
-  // redeemed — по status='redeemed' (подтверждено кассиром)
   const rows = await db.prepare(`
     WITH agg AS (
       SELECT
@@ -73,20 +75,16 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
       p.weight AS weight,
       p.active AS active,
 
-      -- ✅ твои реальные колонки (экономика/тип)
-      p.kind          AS kind,
-      p.coins         AS coins,
-      p.img           AS img,
-      p.cost_cent     AS cost_cent,
+      p.kind AS kind,
+      p.coins AS coins,
+      p.img AS img,
+
+      p.cost_cent AS cost_cent,
       p.cost_currency AS cost_currency,
-      p.spin_cost     AS spin_cost,
 
-      -- ✅ остатки / авто-выкл
-      p.track_qty      AS track_qty,
-      p.qty_total      AS qty_total,
-      p.qty_left       AS qty_left,
+      p.track_qty AS track_qty,
+      p.qty_left AS qty_left,
       p.stop_when_zero AS stop_when_zero
-
     FROM wheel_prizes p
     LEFT JOIN agg a ON a.code = p.code
     WHERE (p.app_id = ? OR p.app_public_id = ?)
@@ -96,9 +94,7 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
     appId, appPublicId
   ).all();
 
-  const results = (rows as any)?.results || [];
-
-  const items = results.map((r: any) => ({
+  const items = (rows && rows.results ? rows.results : []).map(r => ({
     prize_code: String(r.prize_code || ''),
     title: String(r.title || ''),
     wins: Number(r.wins || 0),
@@ -107,23 +103,108 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
     weight: Number(r.weight ?? 0),
     active: Number(r.active ?? 0) ? 1 : 0,
 
-    // экономика/тип (как в твоей таблице)
-    kind: r.kind ? String(r.kind) : undefined,
-    coins: (r.coins === null || r.coins === undefined) ? 0 : Number(r.coins),
-    img: r.img ? String(r.img) : null,
-    cost_cent: (r.cost_cent === null || r.cost_cent === undefined) ? 0 : Number(r.cost_cent),
-    cost_currency: r.cost_currency ? String(r.cost_currency) : null,
-    spin_cost: (r.spin_cost === null || r.spin_cost === undefined) ? 0 : Number(r.spin_cost),
+    kind: String(r.kind || ''),
+    coins: Number(r.coins ?? 0),
+    img: r.img ?? null,
 
-    // остатки
+    cost_cent: Number(r.cost_cent ?? 0),
+    cost_currency: String(r.cost_currency || ''),
+
     track_qty: Number(r.track_qty ?? 0) ? 1 : 0,
-    qty_total: (r.qty_total === null || r.qty_total === undefined) ? null : Number(r.qty_total),
-    qty_left:  (r.qty_left  === null || r.qty_left  === undefined) ? null : Number(r.qty_left),
+    qty_left: (r.qty_left === null || r.qty_left === undefined) ? null : Number(r.qty_left),
     stop_when_zero: Number(r.stop_when_zero ?? 0) ? 1 : 0,
   }));
 
   return json({ ok:true, items }, 200, request);
 }
+
+
+export async function handleCabinetWheelTimeseries(appId, request, env, ownerId){
+  const url = new URL(request.url);
+
+  const from = String(url.searchParams.get('from') || '').trim();
+  const to   = String(url.searchParams.get('to') || '').trim();
+
+  const fromOk = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : null;
+  const toOk   = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : null;
+
+  function addDaysIso(iso, delta){
+    const d = new Date(iso + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + delta);
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth()+1).padStart(2,'0');
+    const day = String(d.getUTCDate()).padStart(2,'0');
+    return `${y}-${m}-${day}`;
+  }
+
+  const toPlus1 = toOk ? addDaysIso(toOk, 1) : null;
+
+  const fromTs = fromOk ? `${fromOk} 00:00:00` : '1970-01-01 00:00:00';
+  const toTs   = (toPlus1 ? `${toPlus1} 00:00:00` : '2999-12-31 00:00:00');
+
+  const appPublicId = await getCanonicalPublicIdForApp(appId, env);
+  if (!appPublicId) {
+    return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
+  }
+
+  const db = env.DB;
+
+  // NOTE: даты берём через substr('YYYY-MM-DD HH:MM:SS', 1, 10)
+  // tz сейчас игнорируем (как у тебя хранится без TZ). Потом можно аккуратно расширить.
+  const rows = await db.prepare(`
+    WITH spins AS (
+      SELECT
+        substr(ts_created, 1, 10) AS d,
+        COUNT(*) AS spins,
+        COALESCE(SUM(COALESCE(spin_cost, 0)), 0) AS spin_cost_coins
+      FROM wheel_spins
+      WHERE (app_id = ? OR app_public_id = ?)
+        AND ts_created >= ?
+        AND ts_created < ?
+      GROUP BY substr(ts_created, 1, 10)
+    ),
+    redeems AS (
+      SELECT
+        substr(issued_at, 1, 10) AS d,
+        COUNT(*) AS wins,
+        SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
+      FROM wheel_redeems
+      WHERE (app_id = ? OR app_public_id = ?)
+        AND issued_at >= ?
+        AND issued_at < ?
+      GROUP BY substr(issued_at, 1, 10)
+    ),
+    days AS (
+      SELECT d FROM spins
+      UNION
+      SELECT d FROM redeems
+    )
+    SELECT
+      days.d AS date,
+      COALESCE(spins.spins, 0) AS spins,
+      COALESCE(spins.spin_cost_coins, 0) AS spin_cost_coins,
+      COALESCE(redeems.wins, 0) AS wins,
+      COALESCE(redeems.redeemed, 0) AS redeemed
+    FROM days
+    LEFT JOIN spins   ON spins.d = days.d
+    LEFT JOIN redeems ON redeems.d = days.d
+    ORDER BY days.d ASC
+  `).bind(
+    appId, appPublicId, fromTs, toTs,
+    appId, appPublicId, fromTs, toTs
+  ).all();
+
+  const days = (rows?.results || []).map(r => ({
+    date: String(r.date || ''),
+    spins: Number(r.spins || 0),
+    spin_cost_coins: Number(r.spin_cost_coins || 0),
+    wins: Number(r.wins || 0),
+    redeemed: Number(r.redeemed || 0),
+  }));
+
+  return json({ ok:true, days }, 200, request);
+}
+
 
 
 export async function handleCabinetSummary(appId, request, env, ownerId){
