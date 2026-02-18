@@ -7,7 +7,7 @@ import { jsonResponse } from "../services/http";
 import { getCanonicalPublicIdForApp } from "../services/apps";
 import {
   parseRangeOrDefault as _parseRangeOrDefault,
-  daysBetweenInclusive as _daysBetweenInclusive,
+  daysBetweenInclusive as _daysBetweenInclusive
 } from "../services/analyticsRange";
 
 // NOTE: legacy used a helper for YYYY-MM-DD + N days.
@@ -24,7 +24,7 @@ function addDaysIso(isoDate: string, days: number): string {
   return dt.toISOString().slice(0, 10);
 }
 
-function toInt(v: any, d = 0) {
+function toInt(v: any, d = 0){
   const n = Number(v);
   if (!Number.isFinite(n)) return d;
   return Math.trunc(n);
@@ -34,209 +34,129 @@ const json = (obj: any, status = 200, request: Request | null = null) =>
   jsonResponse(obj, status, request as any);
 
 // ===== app_settings helper (coin value / currency) =====
-async function getAppSettingsForPublicId(env: Env, appPublicId: string) {
-  try {
+async function getAppSettingsForPublicId(env: Env, appPublicId: string){
+  try{
     const row = await env.DB.prepare(
       `SELECT coin_value_cents, currency
        FROM app_settings
        WHERE app_public_id = ?
        LIMIT 1`
-    )
-      .bind(appPublicId)
-      .first();
+    ).bind(appPublicId).first();
 
     const coin_value_cents = Number(row?.coin_value_cents ?? 100);
-    const currency = String(row?.currency ?? "RUB");
+    const currency = String(row?.currency ?? 'RUB');
 
     return {
-      coin_value_cents:
-        Number.isFinite(coin_value_cents) && coin_value_cents > 0
-          ? Math.floor(coin_value_cents)
-          : 100,
-      currency: (currency || "RUB").toUpperCase().slice(0, 8),
+      coin_value_cents: (Number.isFinite(coin_value_cents) && coin_value_cents > 0) ? Math.floor(coin_value_cents) : 100,
+      currency: (currency || 'RUB').toUpperCase().slice(0, 8),
     };
-  } catch (_) {
-    return { coin_value_cents: 100, currency: "RUB" };
+  }catch(_){
+    return { coin_value_cents: 100, currency: 'RUB' };
   }
 }
 
-// ===============================
-// WHEEL: stats
-// ===============================
-export async function handleCabinetWheelStats(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetWheelStats(appId, request, env, ownerId){
   const url = new URL(request.url);
 
-  const from = String(url.searchParams.get("from") || "").trim();
-  const to = String(url.searchParams.get("to") || "").trim();
+  const from = String(url.searchParams.get('from') || '').trim();
+  const to   = String(url.searchParams.get('to') || '').trim();
 
   const fromOk = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : null;
-  const toOk = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : null;
+  const toOk   = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : null;
 
   const toPlus1 = toOk ? addDaysIso(toOk, 1) : null;
 
-  const fromTs = fromOk ? `${fromOk} 00:00:00` : "1970-01-01 00:00:00";
-  const toTs = toPlus1 ? `${toPlus1} 00:00:00` : "2999-12-31 00:00:00";
+  const fromTs = fromOk ? `${fromOk} 00:00:00` : '1970-01-01 00:00:00';
+  const toTs   = (toPlus1 ? `${toPlus1} 00:00:00` : '2999-12-31 00:00:00');
 
   const appPublicId = await getCanonicalPublicIdForApp(appId, env);
   if (!appPublicId) {
-    return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 404, request);
+    return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
   }
 
   const db = env.DB;
 
-  // try v2 schema (with kind/cost/etc.)
-  try {
-    const rows = await db
-      .prepare(
-        `
-        WITH agg AS (
-          SELECT
-            prize_code AS code,
-            COUNT(*) AS wins,
-            SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
-          FROM wheel_redeems
-          WHERE (app_id = ? OR app_public_id = ?)
-            AND issued_at >= ?
-            AND issued_at < ?
-          GROUP BY prize_code
-        )
-        SELECT
-          p.code  AS prize_code,
-          p.title AS title,
-          COALESCE(a.wins, 0)     AS wins,
-          COALESCE(a.redeemed, 0) AS redeemed,
+  const rows = await db.prepare(`
+    WITH agg AS (
+      SELECT
+        prize_code AS code,
+        COUNT(*) AS wins,
+        SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
+      FROM wheel_redeems
+      WHERE (app_id = ? OR app_public_id = ?)
+        AND issued_at >= ?
+        AND issued_at < ?
+      GROUP BY prize_code
+    )
+    SELECT
+      p.code  AS prize_code,
+      p.title AS title,
+      COALESCE(a.wins, 0)     AS wins,
+      COALESCE(a.redeemed, 0) AS redeemed,
 
-          p.weight AS weight,
-          p.active AS active,
+      p.weight AS weight,
+      p.active AS active,
 
-          p.kind AS kind,
-          p.coins AS coins,
-          p.img AS img,
+      p.kind AS kind,
+      p.coins AS coins,
+      p.img AS img,
 
-          p.cost_cent AS cost_cent,
-          p.cost_currency AS cost_currency,
+      p.cost_cent AS cost_cent,
+      p.cost_currency AS cost_currency,
 
-          p.track_qty AS track_qty,
-          p.qty_left AS qty_left,
-          p.stop_when_zero AS stop_when_zero
-        FROM wheel_prizes p
-        LEFT JOIN agg a ON a.code = p.code
-        WHERE (p.app_id = ? OR p.app_public_id = ?)
-        ORDER BY COALESCE(a.wins,0) DESC, p.code ASC
-      `
-      )
-      .bind(appId, appPublicId, fromTs, toTs, appId, appPublicId)
-      .all();
+      p.track_qty AS track_qty,
+      p.qty_left AS qty_left,
+      p.stop_when_zero AS stop_when_zero
+    FROM wheel_prizes p
+    LEFT JOIN agg a ON a.code = p.code
+    WHERE (p.app_id = ? OR p.app_public_id = ?)
+    ORDER BY COALESCE(a.wins,0) DESC, p.code ASC
+  `).bind(
+    appId, appPublicId, fromTs, toTs,
+    appId, appPublicId
+  ).all();
 
-    const items = (rows?.results || []).map((r: any) => ({
-      prize_code: String(r.prize_code || ""),
-      title: String(r.title || ""),
-      wins: Number(r.wins || 0),
-      redeemed: Number(r.redeemed || 0),
+  const items = (rows && rows.results ? rows.results : []).map(r => ({
+    prize_code: String(r.prize_code || ''),
+    title: String(r.title || ''),
+    wins: Number(r.wins || 0),
+    redeemed: Number(r.redeemed || 0),
 
-      weight: Number(r.weight ?? 0),
-      active: Number(r.active ?? 0) ? 1 : 0,
+    weight: Number(r.weight ?? 0),
+    active: Number(r.active ?? 0) ? 1 : 0,
 
-      kind: String(r.kind || ""),
-      coins: Number(r.coins ?? 0),
-      img: r.img ?? null,
+    kind: String(r.kind || ''),
+    coins: Number(r.coins ?? 0),
+    img: r.img ?? null,
 
-      cost_cent: Number(r.cost_cent ?? 0),
-      cost_currency: String(r.cost_currency || ""),
+    cost_cent: Number(r.cost_cent ?? 0),
+    cost_currency: String(r.cost_currency || ''),
 
-      track_qty: Number(r.track_qty ?? 0) ? 1 : 0,
-      qty_left: r.qty_left === null || r.qty_left === undefined ? null : Number(r.qty_left),
-      stop_when_zero: Number(r.stop_when_zero ?? 0) ? 1 : 0,
-    }));
+    track_qty: Number(r.track_qty ?? 0) ? 1 : 0,
+    qty_left: (r.qty_left === null || r.qty_left === undefined) ? null : Number(r.qty_left),
+    stop_when_zero: Number(r.stop_when_zero ?? 0) ? 1 : 0,
+  }));
 
-    return json({ ok: true, items }, 200, request);
-  } catch (e: any) {
-    const msg = String(e?.message || e);
-
-    // fallback: old schema WITHOUT kind/cost columns
-    // IMPORTANT: this is exactly your case (no such column: kind)
-    if (!msg.includes("no such column: kind")) {
-      // other db error -> return explicit
-      return json({ ok: false, error: "DB_ERROR", message: msg }, 500, request);
-    }
-
-    const rows = await db
-      .prepare(
-        `
-        WITH agg AS (
-          SELECT
-            prize_code AS code,
-            COUNT(*) AS wins,
-            SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
-          FROM wheel_redeems
-          WHERE (app_id = ? OR app_public_id = ?)
-            AND issued_at >= ?
-            AND issued_at < ?
-          GROUP BY prize_code
-        )
-        SELECT
-          p.code  AS prize_code,
-          p.title AS title,
-          COALESCE(a.wins, 0)     AS wins,
-          COALESCE(a.redeemed, 0) AS redeemed,
-          p.weight AS weight,
-          p.active AS active,
-          p.coins AS coins,
-          p.img AS img
-        FROM wheel_prizes p
-        LEFT JOIN agg a ON a.code = p.code
-        WHERE (p.app_id = ? OR p.app_public_id = ?)
-        ORDER BY COALESCE(a.wins,0) DESC, p.code ASC
-      `
-      )
-      .bind(appId, appPublicId, fromTs, toTs, appId, appPublicId)
-      .all();
-
-    const items = (rows?.results || []).map((r: any) => ({
-      prize_code: String(r.prize_code || ""),
-      title: String(r.title || ""),
-      wins: Number(r.wins || 0),
-      redeemed: Number(r.redeemed || 0),
-
-      weight: Number(r.weight ?? 0),
-      active: Number(r.active ?? 0) ? 1 : 0,
-
-      // старые базы: kind/cost/qty не было
-      kind: "",
-      coins: Number(r.coins ?? 0),
-      img: r.img ?? null,
-
-      cost_cent: 0,
-      cost_currency: "",
-      track_qty: 0,
-      qty_left: null,
-      stop_when_zero: 0,
-    }));
-
-    return json({ ok: true, items }, 200, request);
-  }
+  return json({ ok:true, items }, 200, request);
 }
 
-// ===============================
-// WHEEL: timeseries (FACT by dates, NO kind needed)
-// ===============================
-export async function handleCabinetWheelTimeseries(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetWheelTimeseries(appId, request, env, ownerId){
   const url = new URL(request.url);
 
-  const from = String(url.searchParams.get("from") || "").trim();
-  const to = String(url.searchParams.get("to") || "").trim();
+  const from = String(url.searchParams.get('from') || '').trim();
+  const to   = String(url.searchParams.get('to') || '').trim();
 
   const fromOk = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : null;
-  const toOk = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : null;
+  const toOk   = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : null;
 
   const toPlus1 = toOk ? addDaysIso(toOk, 1) : null;
 
-  const fromTs = fromOk ? `${fromOk} 00:00:00` : "1970-01-01 00:00:00";
-  const toTs = toPlus1 ? `${toPlus1} 00:00:00` : "2999-12-31 00:00:00";
+  const fromTs = fromOk ? `${fromOk} 00:00:00` : '1970-01-01 00:00:00';
+  const toTs   = (toPlus1 ? `${toPlus1} 00:00:00` : '2999-12-31 00:00:00');
 
   const appPublicId = await getCanonicalPublicIdForApp(appId, env);
   if (!appPublicId) {
-    return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 404, request);
+    return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
   }
 
   const settings = await getAppSettingsForPublicId(env, appPublicId);
@@ -244,182 +164,223 @@ export async function handleCabinetWheelTimeseries(appId: any, request: Request,
 
   const db = env.DB;
 
-  // NOTE: dates via substr('YYYY-MM-DD HH:MM:SS', 1, 10)
-  const rows = await db
-    .prepare(
-      `
-      WITH spins AS (
-        SELECT
-          substr(ts_created, 1, 10) AS d,
-          COUNT(*) AS spins,
-          COALESCE(SUM(COALESCE(spin_cost, 0)), 0) AS spin_cost_coins
-        FROM wheel_spins
-        WHERE (app_id = ? OR app_public_id = ?)
-          AND ts_created >= ?
-          AND ts_created < ?
-        GROUP BY substr(ts_created, 1, 10)
-      ),
-      redeems AS (
-        SELECT
-          substr(issued_at, 1, 10) AS d,
-          COUNT(*) AS wins,
-          SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
-        FROM wheel_redeems
-        WHERE (app_id = ? OR app_public_id = ?)
-          AND issued_at >= ?
-          AND issued_at < ?
-        GROUP BY substr(issued_at, 1, 10)
-      ),
-      days AS (
-        SELECT d FROM spins
-        UNION
-        SELECT d FROM redeems
-      )
+  // NOTE: даты берём через substr('YYYY-MM-DD HH:MM:SS', 1, 10)
+  // tz сейчас игнорируем (как у тебя хранится без TZ). Потом можно аккуратно расширить.
+  const rows = await db.prepare(`
+    WITH spins AS (
       SELECT
-        days.d AS date,
-        COALESCE(spins.spins, 0) AS spins,
-        COALESCE(spins.spin_cost_coins, 0) AS spin_cost_coins,
-        COALESCE(redeems.wins, 0) AS wins,
-        COALESCE(redeems.redeemed, 0) AS redeemed
-      FROM days
-      LEFT JOIN spins   ON spins.d = days.d
-      LEFT JOIN redeems ON redeems.d = days.d
-      ORDER BY days.d ASC
-    `
-    )
-    .bind(appId, appPublicId, fromTs, toTs, appId, appPublicId, fromTs, toTs)
-    .all();
+        substr(ts_created, 1, 10) AS d,
+        COUNT(*) AS spins,
+        COALESCE(SUM(COALESCE(spin_cost, 0)), 0) AS spin_cost_coins
+      FROM wheel_spins
+      WHERE (app_id = ? OR app_public_id = ?)
+        AND ts_created >= ?
+        AND ts_created < ?
+      GROUP BY substr(ts_created, 1, 10)
+    ),
+    redeems AS (
+      SELECT
+        substr(issued_at, 1, 10) AS d,
+        COUNT(*) AS wins,
+        SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed,
 
-  const days = (rows?.results || []).map((r: any) => {
+        -- coin prizes cost (issued)
+        COALESCE(SUM(
+          CASE WHEN kind='coins' THEN COALESCE(coins,0) ELSE 0 END
+        ),0) AS prize_coins_issued,
+
+        -- coin prizes cost (redeemed)
+        COALESCE(SUM(
+          CASE WHEN status='redeemed' AND kind='coins' THEN COALESCE(coins,0) ELSE 0 END
+        ),0) AS prize_coins_redeemed,
+
+        -- item prizes cost (issued) in cents
+        COALESCE(SUM(
+          CASE WHEN kind!='coins' THEN COALESCE(cost_cent,0) ELSE 0 END
+        ),0) AS item_cost_issued_cents,
+
+        -- item prizes cost (redeemed) in cents
+        COALESCE(SUM(
+          CASE WHEN status='redeemed' AND kind!='coins' THEN COALESCE(cost_cent,0) ELSE 0 END
+        ),0) AS item_cost_redeemed_cents
+      FROM wheel_redeems
+      WHERE (app_id = ? OR app_public_id = ?)
+        AND issued_at >= ?
+        AND issued_at < ?
+      GROUP BY substr(issued_at, 1, 10)
+    ),
+    days AS (
+      SELECT d FROM spins
+      UNION
+      SELECT d FROM redeems
+    )
+    SELECT
+      days.d AS date,
+
+      COALESCE(spins.spins, 0) AS spins,
+      COALESCE(spins.spin_cost_coins, 0) AS spin_cost_coins,
+
+      COALESCE(redeems.wins, 0) AS wins,
+      COALESCE(redeems.redeemed, 0) AS redeemed,
+
+      COALESCE(redeems.prize_coins_issued, 0) AS prize_coins_issued,
+      COALESCE(redeems.prize_coins_redeemed, 0) AS prize_coins_redeemed,
+      COALESCE(redeems.item_cost_issued_cents, 0) AS item_cost_issued_cents,
+      COALESCE(redeems.item_cost_redeemed_cents, 0) AS item_cost_redeemed_cents
+    FROM days
+    LEFT JOIN spins   ON spins.d = days.d
+    LEFT JOIN redeems ON redeems.d = days.d
+    ORDER BY days.d ASC
+  `).bind(
+    appId, appPublicId, fromTs, toTs,
+    appId, appPublicId, fromTs, toTs
+  ).all();
+
+  const days = (rows?.results || []).map(r => {
     const spins = Number(r.spins || 0);
     const spin_cost_coins = Number(r.spin_cost_coins || 0);
 
-    // факт-выручка по фактической стоимости спинов из wheel_spins
-    const revenue_cent = Math.round(spin_cost_coins * coinValueCents);
+    const prize_coins_issued = Number(r.prize_coins_issued || 0);
+    const prize_coins_redeemed = Number(r.prize_coins_redeemed || 0);
+
+    const item_cost_issued_cents = Number(r.item_cost_issued_cents || 0);
+    const item_cost_redeemed_cents = Number(r.item_cost_redeemed_cents || 0);
+
+    const revenue_cents = Math.max(0, Math.round(spin_cost_coins * coinValueCents));
+
+    const payout_issued_cents =
+      Math.max(0, Math.round(prize_coins_issued * coinValueCents)) +
+      Math.max(0, Math.round(item_cost_issued_cents));
+
+    const payout_redeemed_cents =
+      Math.max(0, Math.round(prize_coins_redeemed * coinValueCents)) +
+      Math.max(0, Math.round(item_cost_redeemed_cents));
+
+    const profit_issued_cents = revenue_cents - payout_issued_cents;
+    const profit_redeemed_cents = revenue_cents - payout_redeemed_cents;
 
     return {
-      date: String(r.date || ""),
+      date: String(r.date || ''),
       spins,
+      spin_cost_coins,
       wins: Number(r.wins || 0),
       redeemed: Number(r.redeemed || 0),
-      spin_cost_coins,
-      revenue_cent,
+
+      // NEW: money (cents)
+      revenue_cents,
+      payout_issued_cents,
+      payout_redeemed_cents,
+      profit_issued_cents,
+      profit_redeemed_cents,
     };
   });
 
-  return json({ ok: true, coin_value_cents: coinValueCents, days }, 200, request);
+  // NEW: cumulative profit (cents)
+  let cumIssued = 0;
+  let cumRedeemed = 0;
+  for (const d of days){
+    cumIssued += Number((d as any).profit_issued_cents || 0);
+    cumRedeemed += Number((d as any).profit_redeemed_cents || 0);
+    (d as any).cum_profit_issued_cents = cumIssued;
+    (d as any).cum_profit_redeemed_cents = cumRedeemed;
+  }
+
+  return json({
+    ok: true,
+    settings: { coin_value_cents: coinValueCents, currency: settings.currency },
+    days
+  }, 200, request);
 }
 
-// ===============================
-// Other handlers (оставил как у тебя, без изменений логики)
-// ===============================
-
-export async function handleCabinetSummary(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetSummary(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
-  const from = url.searchParams.get("from");
-  const to = url.searchParams.get("to");
+  const from = url.searchParams.get('from');
+  const to   = url.searchParams.get('to');
 
   const db = env.DB;
 
-  let opens = 0,
-    dau = 0,
-    orders = 0,
-    amount_cents = 0;
+  // Best-effort KPIs (если таблиц нет — вернём нули)
+  let opens = 0, dau = 0, orders = 0, amount_cents = 0;
 
-  try {
-    const row = await db
-      .prepare(
-        `SELECT COUNT(1) AS cnt
-         FROM events
-         WHERE app_public_id = ?
-           AND type='open'
-           ${from ? "AND datetime(created_at) >= datetime(?)" : ""}
-           ${to ? "AND datetime(created_at) <  datetime(?)" : ""}`
-      )
-      .bind(publicId, ...(from ? [from] : []), ...(to ? [to] : []))
-      .first();
-    opens = Number(row?.cnt || 0);
-  } catch (_) {}
+  try{
+    const row = await db.prepare(
+      `SELECT COUNT(1) AS cnt
+       FROM events
+       WHERE app_public_id = ?
+         AND type='open'
+         ${from ? "AND datetime(created_at) >= datetime(?)" : ""}
+         ${to   ? "AND datetime(created_at) <  datetime(?)" : ""}`
+    ).bind(publicId, ...(from?[from]:[]), ...(to?[to]:[])).first();
+    opens = Number(row?.cnt||0);
+  }catch(_){}
 
-  try {
-    const row = await db
-      .prepare(
-        `SELECT COUNT(DISTINCT tg_user_id) AS cnt
-         FROM app_users
-         WHERE app_public_id = ?
-           ${from ? "AND datetime(last_seen) >= datetime(?)" : ""}
-           ${to ? "AND datetime(last_seen) <  datetime(?)" : ""}`
-      )
-      .bind(publicId, ...(from ? [from] : []), ...(to ? [to] : []))
-      .first();
-    dau = Number(row?.cnt || 0);
-  } catch (_) {}
+  try{
+    const row = await db.prepare(
+      `SELECT COUNT(DISTINCT tg_user_id) AS cnt
+       FROM app_users
+       WHERE app_public_id = ?
+         ${from ? "AND datetime(last_seen) >= datetime(?)" : ""}
+         ${to   ? "AND datetime(last_seen) <  datetime(?)" : ""}`
+    ).bind(publicId, ...(from?[from]:[]), ...(to?[to]:[])).first();
+    dau = Number(row?.cnt||0);
+  }catch(_){}
 
-  try {
-    const row = await db
-      .prepare(
-        `SELECT COUNT(1) AS orders, COALESCE(SUM(amount_cents),0) AS amount_cents
-         FROM sales
-         WHERE app_public_id = ?
-           ${from ? "AND datetime(created_at) >= datetime(?)" : ""}
-           ${to ? "AND datetime(created_at) <  datetime(?)" : ""}`
-      )
-      .bind(publicId, ...(from ? [from] : []), ...(to ? [to] : []))
-      .first();
-    orders = Number(row?.orders || 0);
-    amount_cents = Number(row?.amount_cents || 0);
-  } catch (_) {}
+  try{
+    const row = await db.prepare(
+      `SELECT COUNT(1) AS orders, COALESCE(SUM(amount_cents),0) AS amount_cents
+       FROM sales
+       WHERE app_public_id = ?
+         ${from ? "AND datetime(created_at) >= datetime(?)" : ""}
+         ${to   ? "AND datetime(created_at) <  datetime(?)" : ""}`
+    ).bind(publicId, ...(from?[from]:[]), ...(to?[to]:[])).first();
+    orders = Number(row?.orders||0);
+    amount_cents = Number(row?.amount_cents||0);
+  }catch(_){}
 
-  return json(
-    {
-      ok: true,
-      kpi: {
-        opens,
-        dau,
-        sales_orders: orders,
-        sales_amount: amount_cents / 100,
-      },
-    },
-    200,
-    request
-  );
+  return json({
+    ok:true,
+    kpi:{
+      opens,
+      dau,
+      sales_orders: orders,
+      sales_amount: amount_cents/100
+    }
+  }, 200, request);
 }
 
-export async function handleCabinetActivity(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetActivity(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
-  const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 100)));
+  const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit')||100)));
 
-  try {
+  try{
     const rows = await env.DB.prepare(
       `SELECT id, type, created_at, payload
        FROM events
        WHERE app_public_id = ?
        ORDER BY id DESC
        LIMIT ?`
-    )
-      .bind(publicId, limit)
-      .all();
-    return json({ ok: true, items: rows.results || [] }, 200, request);
-  } catch (e) {
-    return json({ ok: true, items: [] }, 200, request);
+    ).bind(publicId, limit).all();
+    return json({ ok:true, items: rows.results || [] }, 200, request);
+  }catch(e){
+    return json({ ok:true, items: [] }, 200, request);
   }
 }
 
-export async function handleCabinetCustomers(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetCustomers(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
-  const q = String(url.searchParams.get("query") || "").trim();
-  const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 50)));
+  const q = String(url.searchParams.get('query')||'').trim();
+  const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit')||50)));
 
-  try {
+  try{
     const rows = await env.DB.prepare(
       `SELECT tg_user_id, tg_username, coins, first_seen, last_seen, total_opens, total_spins, total_prizes
        FROM app_users
@@ -427,24 +388,22 @@ export async function handleCabinetCustomers(appId: any, request: Request, env: 
          ${q ? "AND (tg_user_id LIKE ? OR tg_username LIKE ?)" : ""}
        ORDER BY datetime(last_seen) DESC
        LIMIT ?`
-    )
-      .bind(publicId, ...(q ? [`%${q}%`, `%${q}%`] : []), limit)
-      .all();
-    return json({ ok: true, customers: rows.results || [] }, 200, request);
-  } catch (e) {
-    return json({ ok: true, customers: [] }, 200, request);
+    ).bind(publicId, ...(q?[`%${q}%`,`%${q}%`]:[]), limit).all();
+    return json({ ok:true, customers: rows.results || [] }, 200, request);
+  }catch(e){
+    return json({ ok:true, customers: [] }, 200, request);
   }
 }
 
-export async function handleCabinetSalesStats(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetSalesStats(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
-  const from = url.searchParams.get("from");
-  const to = url.searchParams.get("to");
+  const from = url.searchParams.get('from');
+  const to   = url.searchParams.get('to');
 
-  try {
+  try{
     const rows = await env.DB.prepare(
       `SELECT substr(created_at,1,10) AS day,
               COUNT(1) AS orders,
@@ -452,27 +411,25 @@ export async function handleCabinetSalesStats(appId: any, request: Request, env:
        FROM sales
        WHERE app_public_id = ?
          ${from ? "AND date(created_at) >= date(?)" : ""}
-         ${to ? "AND date(created_at) <= date(?)" : ""}
+         ${to   ? "AND date(created_at) <= date(?)" : ""}
        GROUP BY substr(created_at,1,10)
        ORDER BY day ASC`
-    )
-      .bind(publicId, ...(from ? [from] : []), ...(to ? [to] : []))
-      .all();
-    return json({ ok: true, series: rows.results || [] }, 200, request);
-  } catch (e) {
-    return json({ ok: true, series: [] }, 200, request);
+    ).bind(publicId, ...(from?[from]:[]), ...(to?[to]:[])).all();
+    return json({ ok:true, series: rows.results || [] }, 200, request);
+  }catch(e){
+    return json({ ok:true, series: [] }, 200, request);
   }
 }
 
-export async function handleCabinetPassportStats(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetPassportStats(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
-  const from = url.searchParams.get("from");
-  const to = url.searchParams.get("to");
+  const from = url.searchParams.get('from');
+  const to   = url.searchParams.get('to');
 
-  try {
+  try{
     const rows = await env.DB.prepare(
       `SELECT substr(created_at,1,10) AS day,
               COUNT(1) AS issued,
@@ -480,112 +437,98 @@ export async function handleCabinetPassportStats(appId: any, request: Request, e
        FROM passport_rewards
        WHERE app_public_id = ?
          ${from ? "AND date(created_at) >= date(?)" : ""}
-         ${to ? "AND date(created_at) <= date(?)" : ""}
+         ${to   ? "AND date(created_at) <= date(?)" : ""}
        GROUP BY substr(created_at,1,10)
        ORDER BY day ASC`
-    )
-      .bind(publicId, ...(from ? [from] : []), ...(to ? [to] : []))
-      .all();
-    return json({ ok: true, series: rows.results || [] }, 200, request);
-  } catch (e) {
-    return json({ ok: true, series: [] }, 200, request);
+    ).bind(publicId, ...(from?[from]:[]), ...(to?[to]:[])).all();
+    return json({ ok:true, series: rows.results || [] }, 200, request);
+  }catch(e){
+    return json({ ok:true, series: [] }, 200, request);
   }
 }
 
-export async function handleCabinetCalendarBookings(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetCalendarBookings(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
-  const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 50)));
+  const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit')||50)));
 
-  try {
+  try{
     const rows = await env.DB.prepare(
       `SELECT id, date, time, name, phone, status, created_at
        FROM cal_bookings
        WHERE app_public_id = ?
        ORDER BY datetime(created_at) DESC
        LIMIT ?`
-    )
-      .bind(publicId, limit)
-      .all();
-    return json({ ok: true, bookings: rows.results || [] }, 200, request);
-  } catch (e) {
-    return json({ ok: true, bookings: [] }, 200, request);
+    ).bind(publicId, limit).all();
+    return json({ ok:true, bookings: rows.results || [] }, 200, request);
+  }catch(e){
+    return json({ ok:true, bookings: [] }, 200, request);
   }
 }
 
-export async function handleCabinetProfitReport(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetProfitReport(appId, request, env, ownerId){
+  // Пока "условный" profit: revenue + reward placeholders
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
-  const from = url.searchParams.get("from");
-  const to = url.searchParams.get("to");
+  const from = url.searchParams.get('from');
+  const to   = url.searchParams.get('to');
 
   let amount_cents = 0;
-  try {
+  try{
     const row = await env.DB.prepare(
       `SELECT COALESCE(SUM(amount_cents),0) AS amount_cents
        FROM sales
        WHERE app_public_id = ?
          ${from ? "AND date(created_at) >= date(?)" : ""}
-         ${to ? "AND date(created_at) <= date(?)" : ""}`
-    )
-      .bind(publicId, ...(from ? [from] : []), ...(to ? [to] : []))
-      .first();
-    amount_cents = Number(row?.amount_cents || 0);
-  } catch (_) {}
+         ${to   ? "AND date(created_at) <= date(?)" : ""}`
+    ).bind(publicId, ...(from?[from]:[]), ...(to?[to]:[])).first();
+    amount_cents = Number(row?.amount_cents||0);
+  }catch(_){}
 
-  return json(
-    {
-      ok: true,
-      revenue: amount_cents / 100,
-      reward_cost: null,
-      net: null,
-      note: "profit model not configured yet (need coin_value_cents + prize cost_cents)",
-    },
-    200,
-    request
-  );
+  return json({
+    ok:true,
+    revenue: amount_cents/100,
+    reward_cost: null,
+    net: null,
+    note: 'profit model not configured yet (need coin_value_cents + prize cost_cents)'
+  }, 200, request);
 }
 
-// overview/profit + wheel prizes update/get — оставляю как у тебя (ниже)
-export async function handleCabinetOverview(appId: any, request: Request, env: Env) {
+export async function handleCabinetOverview(appId, request, env){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
   const { from, to } = _parseRangeOrDefault(url);
   const days = _daysBetweenInclusive(from, to);
 
-  const fromD = new Date(from + "T00:00:00Z");
-  const toD = new Date(to + "T00:00:00Z");
-  const spanDays = Math.max(1, Math.round((toD.getTime() - fromD.getTime()) / (24 * 3600 * 1000)) + 1);
-  const prevToD = new Date(fromD.getTime() - 24 * 3600 * 1000);
-  const prevFromD = new Date(prevToD.getTime() - (spanDays - 1) * 24 * 3600 * 1000);
-  const prevFrom = prevFromD.toISOString().slice(0, 10);
-  const prevTo = prevToD.toISOString().slice(0, 10);
+  // previous window (same length)
+  const fromD = new Date(from+'T00:00:00Z');
+  const toD   = new Date(to+'T00:00:00Z');
+  const spanDays = Math.max(1, Math.round((toD as any - fromD as any)/(24*3600*1000))+1);
+  const prevToD = new Date(fromD.getTime() - 24*3600*1000);
+  const prevFromD = new Date(prevToD.getTime() - (spanDays-1)*24*3600*1000);
+  const prevFrom = prevFromD.toISOString().slice(0,10);
+  const prevTo   = prevToD.toISOString().slice(0,10);
 
   const db = env.DB;
 
-  async function safeAll(stmt: string, binds: any[]) {
-    try {
-      return await db.prepare(stmt).bind(...binds).all();
-    } catch (_) {
-      return { results: [] as any[] };
-    }
+  // helper: safe query
+  async function safeAll(stmt, binds){
+    try{ return await db.prepare(stmt).bind(...binds).all(); }
+    catch(_){ return { results: [] }; }
   }
-  async function safeFirst(stmt: string, binds: any[]) {
-    try {
-      return await db.prepare(stmt).bind(...binds).first();
-    } catch (_) {
-      return null;
-    }
+  async function safeFirst(stmt, binds){
+    try{ return await db.prepare(stmt).bind(...binds).first(); }
+    catch(_){ return null; }
   }
 
-  const salesRows = await safeAll(
-    `
+  // sales per day
+  const salesRows = await safeAll(`
     SELECT date(created_at) AS d,
            COUNT(1) AS sales_count,
            COALESCE(SUM(amount_cents),0) AS revenue_cents
@@ -593,37 +536,32 @@ export async function handleCabinetOverview(appId: any, request: Request, env: E
     WHERE app_public_id = ?
       AND date(created_at) BETWEEN date(?) AND date(?)
     GROUP BY date(created_at)
-  `,
-    [publicId, from, to]
-  );
-  const salesMap = new Map((salesRows.results || []).map((r: any) => [String(r.d), r]));
+  `, [publicId, from, to]);
 
-  const newRows = await safeAll(
-    `
+  const salesMap = new Map((salesRows.results||[]).map(r => [String(r.d), r]));
+
+  // new customers per day
+  const newRows = await safeAll(`
     SELECT date(first_seen) AS d, COUNT(1) AS new_customers
     FROM app_users
     WHERE app_public_id = ?
       AND date(first_seen) BETWEEN date(?) AND date(?)
     GROUP BY date(first_seen)
-  `,
-    [publicId, from, to]
-  );
-  const newMap = new Map((newRows.results || []).map((r: any) => [String(r.d), r]));
+  `, [publicId, from, to]);
+  const newMap = new Map((newRows.results||[]).map(r => [String(r.d), r]));
 
-  const actRows = await safeAll(
-    `
+  // active customers per day (from events)
+  const actRows = await safeAll(`
     SELECT date(created_at) AS d, COUNT(DISTINCT tg_user_id) AS active_customers
     FROM events
     WHERE app_public_id = ?
       AND date(created_at) BETWEEN date(?) AND date(?)
     GROUP BY date(created_at)
-  `,
-    [publicId, from, to]
-  );
-  const actMap = new Map((actRows.results || []).map((r: any) => [String(r.d), r]));
+  `, [publicId, from, to]);
+  const actMap = new Map((actRows.results||[]).map(r => [String(r.d), r]));
 
-  const coinRows = await safeAll(
-    `
+  // coins issued/redeemed per day (ledger)
+  const coinRows = await safeAll(`
     SELECT date(ts) AS d,
       COALESCE(SUM(CASE WHEN delta>0 THEN delta ELSE 0 END),0) AS coins_issued,
       COALESCE(SUM(CASE WHEN delta<0 THEN -delta ELSE 0 END),0) AS coins_redeemed
@@ -631,94 +569,78 @@ export async function handleCabinetOverview(appId: any, request: Request, env: E
     WHERE app_public_id = ?
       AND date(ts) BETWEEN date(?) AND date(?)
     GROUP BY date(ts)
-  `,
-    [publicId, from, to]
-  );
-  const coinMap = new Map((coinRows.results || []).map((r: any) => [String(r.d), r]));
+  `, [publicId, from, to]);
+  const coinMap = new Map((coinRows.results||[]).map(r => [String(r.d), r]));
 
-  const series = days.map((d: string) => {
-    const s: any = salesMap.get(d) || {};
-    const revenue = Number(s.revenue_cents || 0) / 100;
-    const sales_count = Number(s.sales_count || 0);
+  // qr_scans best-effort: count sales (if you have dedicated events later — replace)
+  const series = days.map(d => {
+    const s = salesMap.get(d) || {};
+    const revenue = Number(s.revenue_cents||0)/100;
+    const sales_count = Number(s.sales_count||0);
     const avg_check = sales_count ? revenue / sales_count : 0;
 
-    const nw: any = newMap.get(d) || {};
-    const ac: any = actMap.get(d) || {};
-    const cc: any = coinMap.get(d) || {};
+    const nw = newMap.get(d) || {};
+    const ac = actMap.get(d) || {};
+    const cc = coinMap.get(d) || {};
     return {
       d,
       revenue,
       sales_count,
       avg_check,
-      new_customers: Number(nw.new_customers || 0),
-      active_customers: Number(ac.active_customers || 0),
-      coins_issued: Number(cc.coins_issued || 0),
-      coins_redeemed: Number(cc.coins_redeemed || 0),
+      new_customers: Number(nw.new_customers||0),
+      active_customers: Number(ac.active_customers||0),
+      coins_issued: Number(cc.coins_issued||0),
+      coins_redeemed: Number(cc.coins_redeemed||0),
       qr_scans: sales_count,
     };
   });
 
-  function sum(key: string) {
-    return series.reduce((a: number, p: any) => a + Number(p[key] || 0), 0);
+  function sum(key){
+    return series.reduce((a,p)=>a+Number((p as any)[key]||0),0);
   }
 
-  const prevSales: any =
-    (await safeFirst(
-      `
+  // previous KPI (totals) best-effort
+  const prevSales = await safeFirst(`
     SELECT COUNT(1) AS sales_count, COALESCE(SUM(amount_cents),0) AS revenue_cents
     FROM sales
     WHERE app_public_id = ?
       AND date(created_at) BETWEEN date(?) AND date(?)
-  `,
-      [publicId, prevFrom, prevTo]
-    )) || {};
-  const prevRevenue = Number(prevSales.revenue_cents || 0) / 100;
-  const prevSalesCount = Number(prevSales.sales_count || 0);
-  const prevAvg = prevSalesCount ? prevRevenue / prevSalesCount : 0;
+  `, [publicId, prevFrom, prevTo]) || {};
+  const prevRevenue = Number(prevSales.revenue_cents||0)/100;
+  const prevSalesCount = Number(prevSales.sales_count||0);
+  const prevAvg = prevSalesCount ? prevRevenue/prevSalesCount : 0;
 
-  const prevNew: any =
-    (await safeFirst(
-      `
+  const prevNew = await safeFirst(`
     SELECT COUNT(1) AS new_customers
     FROM app_users
     WHERE app_public_id = ?
       AND date(first_seen) BETWEEN date(?) AND date(?)
-  `,
-      [publicId, prevFrom, prevTo]
-    )) || {};
-  const prevActive: any =
-    (await safeFirst(
-      `
+  `, [publicId, prevFrom, prevTo]) || {};
+  const prevActive = await safeFirst(`
     SELECT COUNT(DISTINCT tg_user_id) AS active_customers
     FROM events
     WHERE app_public_id = ?
       AND date(created_at) BETWEEN date(?) AND date(?)
-  `,
-      [publicId, prevFrom, prevTo]
-    )) || {};
-  const prevCoins: any =
-    (await safeFirst(
-      `
+  `, [publicId, prevFrom, prevTo]) || {};
+  const prevCoins = await safeFirst(`
     SELECT
       COALESCE(SUM(CASE WHEN delta>0 THEN delta ELSE 0 END),0) AS coins_issued,
       COALESCE(SUM(CASE WHEN delta<0 THEN -delta ELSE 0 END),0) AS coins_redeemed
     FROM coins_ledger
     WHERE app_public_id = ?
       AND date(ts) BETWEEN date(?) AND date(?)
-  `,
-      [publicId, prevFrom, prevTo]
-    )) || {};
+  `, [publicId, prevFrom, prevTo]) || {};
 
-  const revenue = sum("revenue");
-  const sales_count = sum("sales_count");
-  const avg_check = sales_count ? revenue / sales_count : 0;
+  const revenue = sum('revenue');
+  const sales_count = sum('sales_count');
+  const avg_check = sales_count ? revenue/sales_count : 0;
 
-  const coins_issued = sum("coins_issued");
-  const coins_redeemed = sum("coins_redeemed");
+  const coins_issued = sum('coins_issued');
+  const coins_redeemed = sum('coins_redeemed');
 
-  const qr_scans = sum("qr_scans");
-  const new_customers = sum("new_customers");
-  const active_customers = Math.round(sum("active_customers"));
+  const qr_scans = sum('qr_scans');
+  const new_customers = sum('new_customers');
+  const active_customers = Math.round(sum('active_customers')); // not perfect but ok
 
   const kpi = {
     revenue,
@@ -728,36 +650,77 @@ export async function handleCabinetOverview(appId: any, request: Request, env: E
     avg_check,
     avg_check_prev: prevAvg,
     coins_issued,
-    coins_issued_prev: Number(prevCoins.coins_issued || 0),
+    coins_issued_prev: Number(prevCoins.coins_issued||0),
     coins_redeemed,
-    coins_redeemed_prev: Number(prevCoins.coins_redeemed || 0),
+    coins_redeemed_prev: Number(prevCoins.coins_redeemed||0),
     qr_scans,
     qr_scans_prev: prevSalesCount,
     new_customers,
-    new_customers_prev: Number(prevNew.new_customers || 0),
+    new_customers_prev: Number(prevNew.new_customers||0),
     active_customers,
-    active_customers_prev: Number(prevActive.active_customers || 0),
+    active_customers_prev: Number(prevActive.active_customers||0),
   };
 
-  return json(
-    {
-      ok: true,
-      kpi,
-      series,
-      live: [],
-      alerts: [],
-      top_customers: [],
-      top_prizes: [],
-      top_cashiers: [],
-    },
-    200,
-    request
-  );
+  // top customers: by revenue
+  const topCustRows = await safeAll(`
+    SELECT CAST(tg_id AS TEXT) AS id,
+           COALESCE(MAX(tg_username), '') AS title,
+           COALESCE(SUM(amount_cents),0) AS revenue_cents,
+           COUNT(1) AS sales_count
+    FROM sales
+    WHERE app_public_id = ?
+      AND date(created_at) BETWEEN date(?) AND date(?)
+    GROUP BY tg_id
+    ORDER BY revenue_cents DESC
+    LIMIT 7
+  `, [publicId, from, to]);
+  const top_customers = (topCustRows.results||[]).map(r => ({
+    id: String(r.id||''),
+    title: String(r.title||r.id||'User'),
+    value: Math.round(Number(r.revenue_cents||0)/100),
+    sub: `${Number(r.sales_count||0)} checks`,
+  }));
+
+  // top prizes: by wins/redeemed (best-effort from wheel_redeems)
+  const topPrizeRows = await safeAll(`
+    SELECT prize_code AS prize_code,
+           COALESCE(MAX(prize_title), prize_code) AS title,
+           COUNT(1) AS wins,
+           SUM(CASE WHEN status='redeemed' THEN 1 ELSE 0 END) AS redeemed
+    FROM wheel_redeems
+    WHERE app_public_id = ?
+      AND date(created_at) BETWEEN date(?) AND date(?)
+    GROUP BY prize_code
+    ORDER BY wins DESC
+    LIMIT 7
+  `, [publicId, from, to]);
+  const top_prizes = (topPrizeRows.results||[]).map(r => ({
+    prize_code: String(r.prize_code||''),
+    title: String(r.title||r.prize_code||'Prize'),
+    wins: Number(r.wins||0),
+    redeemed: Number(r.redeemed||0),
+  }));
+
+  // live + alerts placeholders (front expects arrays)
+  const live = [];
+  const alerts = [];
+  const top_cashiers = [];
+
+  return json({
+    ok:true,
+    kpi,
+    series,
+    live,
+    alerts,
+    top_customers,
+    top_prizes,
+    top_cashiers
+  }, 200, request);
 }
 
-export async function handleCabinetProfit(appId: any, request: Request, env: Env) {
+export async function handleCabinetProfit(appId, request, env){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
   const url = new URL(request.url);
   const { from, to } = _parseRangeOrDefault(url);
@@ -765,27 +728,22 @@ export async function handleCabinetProfit(appId: any, request: Request, env: Env
 
   const db = env.DB;
 
-  async function safeAll(stmt: string, binds: any[]) {
-    try {
-      return await db.prepare(stmt).bind(...binds).all();
-    } catch (_) {
-      return { results: [] as any[] };
-    }
+  async function safeAll(stmt, binds){
+    try{ return await db.prepare(stmt).bind(...binds).all(); }
+    catch(_){ return { results: [] }; }
   }
-  async function safeFirst(stmt: string, binds: any[]) {
-    try {
-      return await db.prepare(stmt).bind(...binds).first();
-    } catch (_) {
-      return null;
-    }
+  async function safeFirst(stmt, binds){
+    try{ return await db.prepare(stmt).bind(...binds).first(); }
+    catch(_){ return null; }
   }
 
+  // coin_value (money per coin) from app_settings if exists
   let coin_value = 0;
-  const s: any = await safeFirst(`SELECT coin_value_cents FROM app_settings WHERE app_public_id=? LIMIT 1`, [publicId]);
-  if (s && s.coin_value_cents !== undefined && s.coin_value_cents !== null) coin_value = Number(s.coin_value_cents || 0) / 100;
+  const s = await safeFirst(`SELECT coin_value_cents FROM app_settings WHERE app_public_id=? LIMIT 1`, [publicId]);
+  if (s && s.coin_value_cents !== undefined && s.coin_value_cents !== null) coin_value = Number(s.coin_value_cents||0)/100;
 
-  const salesRows = await safeAll(
-    `
+  // sales per day
+  const salesRows = await safeAll(`
     SELECT date(created_at) AS d,
            COUNT(1) AS checks,
            COALESCE(SUM(amount_cents),0) AS revenue_cents
@@ -793,13 +751,10 @@ export async function handleCabinetProfit(appId: any, request: Request, env: Env
     WHERE app_public_id = ?
       AND date(created_at) BETWEEN date(?) AND date(?)
     GROUP BY date(created_at)
-  `,
-    [publicId, from, to]
-  );
-  const salesMap = new Map((salesRows.results || []).map((r: any) => [String(r.d), r]));
+  `, [publicId, from, to]);
+  const salesMap = new Map((salesRows.results||[]).map(r => [String(r.d), r]));
 
-  const coinRows = await safeAll(
-    `
+  const coinRows = await safeAll(`
     SELECT date(ts) AS d,
       COALESCE(SUM(CASE WHEN delta>0 THEN delta ELSE 0 END),0) AS coins_issued,
       COALESCE(SUM(CASE WHEN delta<0 THEN -delta ELSE 0 END),0) AS coins_redeemed
@@ -807,50 +762,61 @@ export async function handleCabinetProfit(appId: any, request: Request, env: Env
     WHERE app_public_id = ?
       AND date(ts) BETWEEN date(?) AND date(?)
     GROUP BY date(ts)
-  `,
-    [publicId, from, to]
-  );
-  const coinMap = new Map((coinRows.results || []).map((r: any) => [String(r.d), r]));
+  `, [publicId, from, to]);
+  const coinMap = new Map((coinRows.results||[]).map(r => [String(r.d), r]));
 
-  const outRow: any = (await safeFirst(`SELECT COALESCE(SUM(coins),0) AS outstanding FROM app_users WHERE app_public_id=?`, [publicId])) || {};
-  const outstanding_coins = Number(outRow.outstanding || 0);
+  // outstanding coins: sum coins from app_users (best-effort)
+  const outRow = await safeFirst(`SELECT COALESCE(SUM(coins),0) AS outstanding FROM app_users WHERE app_public_id=?`, [publicId]) || {};
+  const outstanding_coins = Number(outRow.outstanding||0);
 
-  const series = days.map((d: string) => {
-    const s: any = salesMap.get(d) || {};
-    const revenue = Number(s.revenue_cents || 0) / 100;
-    const c: any = coinMap.get(d) || {};
-    const coins_issued = Number(c.coins_issued || 0);
-    const coins_redeemed = Number(c.coins_redeemed || 0);
+  const series = days.map(d => {
+    const s = salesMap.get(d) || {};
+    const revenue = Number(s.revenue_cents||0)/100;
+    const checks = Number(s.checks||0);
+    const c = coinMap.get(d) || {};
+    const coins_issued = Number(c.coins_issued||0);
+    const coins_redeemed = Number(c.coins_redeemed||0);
 
     const cogs = 0;
     const gross_profit = revenue - cogs;
     const issued_cost = coins_issued * coin_value;
     const redeemed_cost = coins_redeemed * coin_value;
 
+    // liability is "total outstanding" (constant)
     const liability_value = outstanding_coins * coin_value;
     const net_profit = gross_profit - redeemed_cost;
 
-    return { d, revenue, cogs, gross_profit, net_profit, redeemed_cost, issued_cost, liability_value };
+    return {
+      d,
+      revenue,
+      cogs,
+      gross_profit,
+      net_profit,
+      redeemed_cost,
+      issued_cost,
+      liability_value,
+    };
   });
 
-  function sum(key: string) {
-    return series.reduce((a: number, p: any) => a + Number(p[key] || 0), 0);
-  }
+  function sum(key){ return series.reduce((a,p)=>a+Number((p as any)[key]||0),0); }
 
-  const revenue = sum("revenue");
-  const coinsIssued = (coinRows.results || []).reduce((a: number, r: any) => a + Number(r.coins_issued || 0), 0);
-  const coinsRedeemed = (coinRows.results || []).reduce((a: number, r: any) => a + Number(r.coins_redeemed || 0), 0);
+  const revenue = sum('revenue');
+  const checks = (salesRows.results||[]).reduce((a,r)=>a+Number(r.checks||0),0);
+  const avg_check = checks ? revenue/checks : 0;
+
+  const coinsIssued = (coinRows.results||[]).reduce((a,r)=>a+Number(r.coins_issued||0),0);
+  const coinsRedeemed = (coinRows.results||[]).reduce((a,r)=>a+Number(r.coins_redeemed||0),0);
 
   const cogs = 0;
   const gross_profit = revenue - cogs;
-  const gross_margin_pct = revenue ? (gross_profit / revenue) * 100 : 0;
+  const gross_margin_pct = revenue ? (gross_profit/revenue)*100 : 0;
 
   const issued_cost = coinsIssued * coin_value;
   const redeemed_cost = coinsRedeemed * coin_value;
   const liability_value = outstanding_coins * coin_value;
 
   const net_profit = gross_profit - redeemed_cost;
-  const reward_rate_pct = revenue ? (redeemed_cost / revenue) * 100 : 0;
+  const reward_rate_pct = revenue ? (redeemed_cost/revenue)*100 : 0;
 
   const kpi = {
     revenue,
@@ -866,48 +832,50 @@ export async function handleCabinetProfit(appId: any, request: Request, env: Env
     liability_value,
     net_profit,
     reward_rate_pct,
-    avg_check: 0,
-    checks: 0,
+    avg_check,
+    checks
   };
 
-  return json({ ok: true, kpi, series, live: [], alerts: [], top_drivers: [] }, 200, request);
+  const live = [];
+  const alerts = [];
+  const top_drivers = []; // future: what eats profit
+
+  return json({ ok:true, kpi, series, live, alerts, top_drivers }, 200, request);
 }
 
-export async function handleCabinetWheelPrizesGet(appId: any, request: Request, env: Env, ownerId: any) {
+export async function handleCabinetWheelPrizesGet(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!publicId) return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 500, request);
+  if (!publicId) return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 500, request);
 
-  try {
+  try{
     const rows = await env.DB.prepare(
       `SELECT id, code, title, weight, coins, active
        FROM wheel_prizes
        WHERE app_public_id = ?
        ORDER BY id ASC`
-    )
-      .bind(publicId)
-      .all();
-    return json({ ok: true, items: rows.results || [] }, 200, request);
-  } catch (e) {
-    return json({ ok: true, items: [] }, 200, request);
+    ).bind(publicId).all();
+    return json({ ok:true, items: rows.results || [] }, 200, request);
+  }catch(e){
+    return json({ ok:true, items: [] }, 200, request);
   }
 }
 
-export async function handleCabinetWheelPrizesUpdate(appId: any, request: Request, env: Env, ownerId: any) {
-  let body: any;
-  try {
+export async function handleCabinetWheelPrizesUpdate(appId, request, env, ownerId){
+  let body;
+  try{
     body = await request.json();
-  } catch (_) {
-    return json({ ok: false, error: "BAD_JSON" }, 400, request);
+  }catch(_){
+    return json({ ok:false, error:'BAD_JSON' }, 400, request);
   }
 
   const items = Array.isArray(body?.items) ? body.items : null;
-  if (!items || !items.length) {
-    return json({ ok: false, error: "NO_ITEMS" }, 400, request);
+  if (!items || !items.length){
+    return json({ ok:false, error:'NO_ITEMS' }, 400, request);
   }
 
-  const norm: Array<{ code: string; weight: number; active: 0 | 1 }> = [];
-  for (const it of items) {
-    const code = String(it?.prize_code || it?.code || "").trim();
+  const norm = [];
+  for (const it of items){
+    const code = String(it?.prize_code || it?.code || '').trim();
     if (!code) continue;
 
     const weight = Math.max(0, toInt(it.weight, 0));
@@ -916,33 +884,29 @@ export async function handleCabinetWheelPrizesUpdate(appId: any, request: Reques
     norm.push({ code, weight, active });
   }
 
-  if (!norm.length) {
-    return json({ ok: false, error: "NO_VALID_ITEMS" }, 400, request);
+  if (!norm.length){
+    return json({ ok:false, error:'NO_VALID_ITEMS' }, 400, request);
   }
 
   const appPublicId = await getCanonicalPublicIdForApp(appId, env);
-  if (!appPublicId) {
-    return json({ ok: false, error: "APP_PUBLIC_ID_NOT_FOUND" }, 404, request);
+  if (!appPublicId){
+    return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
   }
 
   let updated = 0;
 
-  for (const it of norm) {
-    const res = await env.DB.prepare(
-      `
+  for (const it of norm){
+    const res = await env.DB.prepare(`
       UPDATE wheel_prizes
       SET weight = ?, active = ?
       WHERE app_public_id = ?
         AND code = ?
-    `
-    )
-      .bind(it.weight, it.active, appPublicId, it.code)
-      .run();
+    `).bind(it.weight, it.active, appPublicId, it.code).run();
 
-    if ((res as any)?.meta?.changes) {
-      updated += (res as any).meta.changes;
+    if (res?.meta?.changes){
+      updated += res.meta.changes;
     }
   }
 
-  return json({ ok: true, updated }, 200, request);
+  return json({ ok:true, updated }, 200, request);
 }
