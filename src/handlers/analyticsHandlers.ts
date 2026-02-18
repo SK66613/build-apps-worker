@@ -57,9 +57,7 @@ async function getAppSettingsForPublicId(env: Env, appPublicId: string){
 
 /**
  * CABINET: WHEEL STATS (PRIZE TABLE)
- * ✅ Facts (wins/redeemed) from wheel_spins (history)
- * ✅ Prize settings/stock from wheel_prizes (current config)
- */
+
 export async function handleCabinetWheelStats(appId, request, env, ownerId){
   const url = new URL(request.url);
 
@@ -121,7 +119,7 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
     appId, appPublicId
   ).all();
 
-  const items = (rows && rows.results ? rows.results : []).map(r => ({
+  const items = (rows?.results || []).map(r => ({
     prize_code: String(r.prize_code || ''),
     title: String(r.title || ''),
     wins: Number(r.wins || 0),
@@ -145,15 +143,6 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
   return json({ ok:true, items }, 200, request);
 }
 
-/**
- * CABINET: WHEEL TIMESERIES (DAILY)
- * ✅ ONLY wheel_spins snapshots — no recalculation via app_settings / wheel_prizes
- * Expects wheel_spins has:
- *   ts_created, ts_issued, ts_redeemed,
- *   spin_cost, coin_value_cents,
- *   prize_kind, prize_coins,
- *   prize_cost
- */
 export async function handleCabinetWheelTimeseries(appId, request, env, ownerId){
   const url = new URL(request.url);
 
@@ -180,27 +169,29 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
       substr(ts_created, 1, 10) AS date,
 
       COUNT(*) AS spins,
+      COALESCE(SUM(COALESCE(spin_cost,0)), 0) AS spin_cost_coins,
+
       SUM(CASE WHEN ts_issued   IS NOT NULL THEN 1 ELSE 0 END) AS wins,
       SUM(CASE WHEN ts_redeemed IS NOT NULL THEN 1 ELSE 0 END) AS redeemed,
 
-      -- revenue snapshot per spin
+      -- money snapshots (cents): revenue per spin = spin_cost * coin_value_cents at that moment
       COALESCE(SUM(COALESCE(spin_cost,0) * COALESCE(coin_value_cents,0)), 0) AS revenue_cents,
 
-      -- payout at "issued moment" (only for wins)
+      -- payout issued: for wins only
       COALESCE(SUM(
         CASE
           WHEN ts_issued IS NULL THEN 0
           WHEN prize_kind = 'coins' THEN COALESCE(prize_coins,0) * COALESCE(coin_value_cents,0)
-          ELSE COALESCE(prize_cost,0)
+          ELSE COALESCE(prize_cost_cent,0)
         END
       ), 0) AS payout_issued_cents,
 
-      -- payout at "redeemed moment" (only for redeemed)
+      -- payout redeemed: for redeemed only
       COALESCE(SUM(
         CASE
           WHEN ts_redeemed IS NULL THEN 0
           WHEN prize_kind = 'coins' THEN COALESCE(prize_coins,0) * COALESCE(coin_value_cents,0)
-          ELSE COALESCE(prize_cost,0)
+          ELSE COALESCE(prize_cost_cent,0)
         END
       ), 0) AS payout_redeemed_cents
 
@@ -222,6 +213,7 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
     return {
       date: String(r.date || ''),
       spins: Number(r.spins || 0),
+      spin_cost_coins: Number(r.spin_cost_coins || 0),
       wins: Number(r.wins || 0),
       redeemed: Number(r.redeemed || 0),
 
@@ -233,8 +225,18 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
     };
   });
 
-  // optional: keep returning settings for back-compat / UI display (NOT used in calculations anymore)
+  // back-compat (для UI; но НЕ используем для пересчётов истории)
   const settings = await getAppSettingsForPublicId(env, appPublicId);
+
+  // cumulative
+  let cumIssued = 0;
+  let cumRedeemed = 0;
+  for (const d of days){
+    cumIssued += Number((d as any).profit_issued_cents || 0);
+    cumRedeemed += Number((d as any).profit_redeemed_cents || 0);
+    (d as any).cum_profit_issued_cents = cumIssued;
+    (d as any).cum_profit_redeemed_cents = cumRedeemed;
+  }
 
   return json({
     ok: true,
@@ -242,6 +244,7 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
     days
   }, 200, request);
 }
+
 
 export async function handleCabinetSummary(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
