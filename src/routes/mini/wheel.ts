@@ -533,71 +533,82 @@ await db.prepare(
 
     
 
-    const coinCostCent = Math.max(
-      0,
-      Math.floor(Number((cfg as any)?.coins?.cost_cent_per_coin ?? (cfg as any)?.wheel?.coin_cost_cent ?? 0))
-    );
+// ===== cost calc (for analytics / profit) =====
+const coinCostCent = Math.max(
+  0,
+  Math.floor(
+    Number(
+      (cfg as any)?.coins?.cost_cent_per_coin ??
+      (cfg as any)?.wheel?.coin_cost_cent ??
+      0
+    )
+  )
+);
 
-    const costCent =
-      kind === "coins"
-        ? prizeCoins * coinCostCent
-        : Math.max(0, Math.floor(Number(prDetails?.cost_cent ?? prize.cost_cent ?? 0)));
+const costCent =
+  kind === "coins"
+    ? prizeCoins * coinCostCent
+    : Math.max(0, Math.floor(Number(prDetails?.cost_cent ?? prize.cost_cent ?? 0)));
 
-    const costCurrencyRaw = prDetails?.cost_currency ?? prize.cost_currency ?? "RUB";
-    const costCurrency = costCurrencyRaw ? String(costCurrencyRaw) : null;
+const costCurrencyRaw = prDetails?.cost_currency ?? prize.cost_currency ?? "RUB";
+const costCurrency = costCurrencyRaw ? String(costCurrencyRaw) : null;
 
+// ===== 5) issue redeem (wheel_redeems) =====
+// ВАЖНО: пишем kind + coins прямо в wheel_redeems
+let redeem: any = null;
+for (let i = 0; i < 5; i++) {
+  const redeemCode = randomRedeemCodeLocal(10);
+  try {
+    const ins2 = await db
+      .prepare(
+        `INSERT INTO wheel_redeems
+           (app_id, app_public_id, tg_id, spin_id, prize_code, prize_title,
+            redeem_code, status, issued_at, img, expires_at,
+            kind, coins,
+            cost_cent, cost_currency)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?, NULL, ?, ?, ?, ?)`
+      )
+      .bind(
+        (ctx as any).appId,
+        appPublicId,
+        tgUserId,
+        spinId,
+        String(prize.code || ""),
+        String(prize.title || ""),
+        redeemCode,
+        prizeImg,
 
+        // NEW:
+        String(kind || "item"),
+        Number.isFinite(Number(prizeCoins)) ? Math.max(0, Math.floor(Number(prizeCoins))) : 0,
 
+        // existing:
+        costCent,
+        costCurrency
+      )
+      .run();
 
-
-    
-
-    // 5) issue redeem (wheel_redeems)
-    let redeem: any = null;
-    for (let i = 0; i < 5; i++) {
-      const redeemCode = randomRedeemCodeLocal(10);
-      try {
-        const ins2 = await db
-          .prepare(
-            `INSERT INTO wheel_redeems
-               (app_id, app_public_id, tg_id, spin_id, prize_code, prize_title,
-                redeem_code, status, issued_at, img, expires_at, cost_cent, cost_currency)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?, NULL, ?, ?)`
-          )
-          .bind(
-            (ctx as any).appId,
-            appPublicId,
-            tgUserId,
-            spinId,
-            String(prize.code || ""),
-            String(prize.title || ""),
-            redeemCode,
-            prizeImg,
-            costCent,
-            costCurrency
-          )
-          .run();
-
-        redeem = {
-          id: Number((ins2 as any)?.meta?.last_row_id || (ins2 as any)?.lastInsertRowid || 0),
-          redeem_code: redeemCode,
-        };
-        break;
-      } catch (e: any) {
-        const msg = String(e?.message || e);
-        if (!/unique|constraint/i.test(msg)) {
-          logWheelEvent({
-            code: "mini.wheel.spin.fail.db_error",
-            msg: "Failed to issue reward",
-            appPublicId,
-            tgUserId,
-            route,
-            extra: { spinId, error: msg },
-          });
-          return json({ ok: false, error: "REDEEM_CREATE_FAILED" }, 500, request);
-        }
-      }
+    redeem = {
+      id: Number((ins2 as any)?.meta?.last_row_id || (ins2 as any)?.lastInsertRowid || 0),
+      redeem_code: redeemCode,
+    };
+    break;
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (!/unique|constraint/i.test(msg)) {
+      logWheelEvent({
+        code: "mini.wheel.spin.fail.db_error",
+        msg: "Failed to issue reward",
+        appPublicId,
+        tgUserId,
+        route,
+        extra: { spinId, error: msg },
+      });
+      return json({ ok: false, error: "REDEEM_CREATE_FAILED" }, 500, request);
     }
+  }
+}
+
 
     if (!redeem?.id) {
       logWheelEvent({
