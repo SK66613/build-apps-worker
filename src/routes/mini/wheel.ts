@@ -15,6 +15,7 @@ function logWheelEvent(event: {
   } catch (_) {}
 }
 
+
 function randomRedeemCodeLocal(len = 10) {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const bytes = crypto.getRandomValues(new Uint8Array(len));
