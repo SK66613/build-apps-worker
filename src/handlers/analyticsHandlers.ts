@@ -39,11 +39,10 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
   const toPlus1 = toOk ? addDaysIso(toOk, 1) : null;
 
   // диапазон в формате datetime (как у тебя хранится issued_at: 'YYYY-MM-DD HH:MM:SS')
-  // если нет дат — просто очень широкий диапазон
   const fromTs = fromOk ? `${fromOk} 00:00:00` : '1970-01-01 00:00:00';
   const toTs   = (toPlus1 ? `${toPlus1} 00:00:00` : '2999-12-31 00:00:00');
 
-  // канонический public_id нужен для wheel_prizes (у тебя wheel_prizes чистится по app_public_id)
+  // канонический public_id нужен для wheel_prizes
   const appPublicId = await getCanonicalPublicIdForApp(appId, env);
   if (!appPublicId) {
     return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
@@ -51,14 +50,8 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
 
   const db = env.DB;
 
-  // ВАЖНО: wins считаем по wheel_redeems (это факт выигрыша/выдачи redeem_code)
+  // wins считаем по wheel_redeems (факт выигрыша / выдачи redeem_code)
   // redeemed — по status='redeemed' (подтверждено кассиром)
-  //
-  // ДОБАВЛЕНО:
-  //  - остатки: track_qty / qty_left / stop_when_zero (чтобы кабинет понимал авто-выкл при нуле)
-  //  - (опционально) экономика приза: kind/coins/cost_* если эти колонки есть в wheel_prizes
-  //
-  // ВАЖНО: если в wheel_prizes нет каких-то колонок (kind/cost_*), просто удали их из SELECT ниже.
   const rows = await db.prepare(`
     WITH agg AS (
       SELECT
@@ -80,17 +73,19 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
       p.weight AS weight,
       p.active AS active,
 
-      -- ✅ остатки / авто-выкл
-      p.track_qty      AS track_qty,
-      p.qty_left       AS qty_left,
-      p.stop_when_zero AS stop_when_zero,
-
-      -- (опционально) если есть в wheel_prizes
+      -- ✅ твои реальные колонки (экономика/тип)
       p.kind          AS kind,
       p.coins         AS coins,
+      p.img           AS img,
       p.cost_cent     AS cost_cent,
       p.cost_currency AS cost_currency,
-      p.cost          AS cost
+      p.spin_cost     AS spin_cost,
+
+      -- ✅ остатки / авто-выкл
+      p.track_qty      AS track_qty,
+      p.qty_total      AS qty_total,
+      p.qty_left       AS qty_left,
+      p.stop_when_zero AS stop_when_zero
 
     FROM wheel_prizes p
     LEFT JOIN agg a ON a.code = p.code
@@ -101,25 +96,30 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
     appId, appPublicId
   ).all();
 
-  const items = (rows && (rows as any).results ? (rows as any).results : []).map((r: any) => ({
+  const results = (rows as any)?.results || [];
+
+  const items = results.map((r: any) => ({
     prize_code: String(r.prize_code || ''),
     title: String(r.title || ''),
     wins: Number(r.wins || 0),
     redeemed: Number(r.redeemed || 0),
+
     weight: Number(r.weight ?? 0),
     active: Number(r.active ?? 0) ? 1 : 0,
 
-    // ✅ остатки / авто-выкл
-    track_qty: Number(r.track_qty ?? 0) ? 1 : 0,
-    qty_left: (r.qty_left === null || r.qty_left === undefined) ? null : Number(r.qty_left),
-    stop_when_zero: Number(r.stop_when_zero ?? 0) ? 1 : 0,
-
-    // (опционально)
+    // экономика/тип (как в твоей таблице)
     kind: r.kind ? String(r.kind) : undefined,
-    coins: (r.coins === null || r.coins === undefined) ? undefined : Number(r.coins),
-    cost_cent: (r.cost_cent === null || r.cost_cent === undefined) ? undefined : Number(r.cost_cent),
-    cost_currency: r.cost_currency ? String(r.cost_currency) : undefined,
-    cost: (r.cost === null || r.cost === undefined) ? undefined : Number(r.cost),
+    coins: (r.coins === null || r.coins === undefined) ? 0 : Number(r.coins),
+    img: r.img ? String(r.img) : null,
+    cost_cent: (r.cost_cent === null || r.cost_cent === undefined) ? 0 : Number(r.cost_cent),
+    cost_currency: r.cost_currency ? String(r.cost_currency) : null,
+    spin_cost: (r.spin_cost === null || r.spin_cost === undefined) ? 0 : Number(r.spin_cost),
+
+    // остатки
+    track_qty: Number(r.track_qty ?? 0) ? 1 : 0,
+    qty_total: (r.qty_total === null || r.qty_total === undefined) ? null : Number(r.qty_total),
+    qty_left:  (r.qty_left  === null || r.qty_left  === undefined) ? null : Number(r.qty_left),
+    stop_when_zero: Number(r.stop_when_zero ?? 0) ? 1 : 0,
   }));
 
   return json({ ok:true, items }, 200, request);
