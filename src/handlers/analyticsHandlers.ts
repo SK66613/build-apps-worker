@@ -55,8 +55,7 @@ async function getAppSettingsForPublicId(env: Env, appPublicId: string){
   }
 }
 
-/**
- * CABINET: WHEEL STATS (PRIZE TABLE)
+// CABINET: WHEEL STATS (PRIZE TABLE)
 
 export async function handleCabinetWheelStats(appId, request, env, ownerId){
   const url = new URL(request.url);
