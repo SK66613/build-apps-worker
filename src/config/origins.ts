@@ -10,3 +10,4 @@ export const ALLOW_ORIGINS = [
 ] as const;
 
 export const ALLOW_ORIGINS_SET = new Set<string>(ALLOW_ORIGINS as unknown as string[]);
+
