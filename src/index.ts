@@ -13,7 +13,7 @@ import { routeCabinet } from "./routes/cabinet";
 import { routeTemplates } from "./routes/templates";
 import { routeAnalytics } from "./routes/analytics";
 
-import { corsHeaders, withCors } from "./services/cors";
+
 
 export interface Env {
   DB: D1Database;
@@ -34,16 +34,11 @@ export default {
 
       const url = new URL(request.url);
 
-// Важно: раньше legacy, чтобы legacy вообще не касался /api/mini/*
 if (url.pathname.startsWith("/api/mini/")) {
-  // CORS preflight для зеркала/других доменов
-  if (request.method === "OPTIONS") {
-    return new Response("", { status: 204, headers: corsHeaders(request) });
-  }
-
   const res = await routeMiniApi(request, env);
   return withCors(request, res);
 }
+
 
 
 
