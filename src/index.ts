@@ -13,8 +13,6 @@ import { routeCabinet } from "./routes/cabinet";
 import { routeTemplates } from "./routes/templates";
 import { routeAnalytics } from "./routes/analytics";
 
-
-
 export interface Env {
   DB: D1Database;
   APPS: KVNamespace;
@@ -34,12 +32,13 @@ export default {
 
       const url = new URL(request.url);
 
+      // Mini API (published mini-app runtime)
+// Важно: раньше legacy, чтобы legacy вообще не касался /api/mini/*
 if (url.pathname.startsWith("/api/mini/")) {
-  const res = await routeMiniApi(request, env);
-  return withCors(request, res);
+  // CSRF allowlist уже проверяется выше (у тебя стоит на /api/*)
+  const r = await routeMiniApi(request, env, url);
+  return withCors(request, r);
 }
-
-
 
 
 
