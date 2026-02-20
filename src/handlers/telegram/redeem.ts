@@ -419,8 +419,29 @@ export async function handleRedeem(args: {
       return true;
     }
 
+    // === сначала пробуем WHEEL по redeem_code (иначе r будет undefined и всё падает)
+    let r: any = null;
+    try {
+      r = await db.prepare(
+        `SELECT id, tg_id, prize_code, prize_title, status
+         FROM wheel_redeems
+         WHERE app_public_id=? AND redeem_code=?
+         LIMIT 1`
+      ).bind(appPublicId, redeemCode).first();
+    } catch (e: any) {
+      logRedeemEvent({
+        code: "mini.redeem.start.fail.db_error",
+        msg: "Failed to fetch wheel redeem on /start",
+        appPublicId,
+        tgUserId: from2Id,
+        route: "wheel.cashier.start",
+        extra: { redeemCode, error: String(e?.message || e) },
+      });
+      await tgSendMessage(env, botToken, msgChatId, "⛔️ Ошибка БД, попробуйте ещё раз.", {}, { appPublicId, tgUserId: from2Id }).catch(() => null);
+      return true;
+    }
 
-
+    // --- если wheel не нашли — это PASSPORT (или вообще левый код)
     if (!r) {
       const pr: any = await db.prepare(
         `SELECT id, tg_id, prize_code, prize_title, coins, status
@@ -438,6 +459,75 @@ export async function handleRedeem(args: {
         await tgSendMessage(env, botToken, msgChatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from2Id }).catch(() => null);
         return true;
       }
+
+      await kvPutJson(
+        env,
+        redeemActionKey(appPublicId, redeemCode, String(from2Id)),
+        { kind: "passport", redeemCode },
+        3600
+      );
+
+      const coins = Math.max(0, Math.floor(Number(pr.coins || 0)));
+
+      await tgSendMessage(
+        env,
+        botToken,
+        msgChatId,
+        `❓ Подтвердить выдачу приза по паспорту?\nКод: <code>${escHtml(redeemCode)}</code>\nПриз: <b>${escHtml(String(pr.prize_title || ""))}</b>` +
+          (coins > 0 ? `\n🪙 Монеты: <b>${coins}</b>` : ""),
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "✅ Да, выдать", callback_data: `redeem_confirm:${redeemCode}` },
+              { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` },
+            ]],
+          },
+        },
+        { appPublicId, tgUserId: from2Id }
+      ).catch(() => null);
+
+      return true;
+    }
+
+    // --- WHEEL найден: показываем подтверждение wheel
+    if (String(r.status) === "redeemed") {
+      await tgSendMessage(env, botToken, msgChatId, "ℹ️ Этот приз уже отмечен как полученный.", {}, { appPublicId, tgUserId: from2Id }).catch(() => null);
+      return true;
+    }
+
+    let coins = 0;
+    try {
+      const pr2: any = await db.prepare(
+        `SELECT coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`
+      ).bind(appPublicId, String(r.prize_code || "")).first();
+      coins = Math.max(0, Math.floor(Number(pr2?.coins || 0)));
+    } catch (_) {}
+
+    await kvPutJson(
+      env,
+      redeemActionKey(appPublicId, redeemCode, String(from2Id)),
+      { kind: "wheel", redeemCode },
+      3600
+    );
+
+    await tgSendMessage(
+      env,
+      botToken,
+      msgChatId,
+      `❓ Подтвердить выдачу приза?\nКод: <code>${escHtml(redeemCode)}</code>\nПриз: <b>${escHtml(String(r.prize_title || ""))}</b>` +
+        (coins > 0 ? `\n🪙 Монеты: <b>${coins}</b>` : ""),
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ Да, выдать", callback_data: `redeem_confirm:${redeemCode}` },
+            { text: "⛔️ Нет", callback_data: `redeem_decline:${redeemCode}` },
+          ]],
+        },
+      },
+      { appPublicId, tgUserId: from2Id }
+    ).catch(() => null);
+
+    return true;
 
       // KV act (passport)
       await kvPutJson(
