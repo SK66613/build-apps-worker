@@ -15,6 +15,13 @@ function pick(obj: any, key: string, fallback: any) {
   return v === undefined ? fallback : v;
 }
 
+function toCostCentFromMajor(v: any): number {
+  // UI/настройки вводятся в "рублях" (major units) -> храним в копейках (cents)
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.max(0, Math.round(n * 100));
+}
+
 export async function syncRuntimeTablesFromConfig(appId: any, publicId: string, cfg: any, env: Env) {
   const out: any = { wheelInserted: 0, stylesInserted: 0 };
   try {
@@ -49,7 +56,10 @@ export async function syncRuntimeTablesFromConfig(appId: any, publicId: string, 
       if (wheelCols.has("kind")) row.kind = String(p?.kind || "");
       if (wheelCols.has("img")) row.img = p?.img ? String(p.img) : null;
 
-      if (wheelCols.has("cost_cent")) row.cost_cent = Math.max(0, Math.round(Number(p?.cost_cent ?? p?.cost ?? 0)));
+      if (wheelCols.has("cost_cent")) {
+  const major = (p?.cost_cent ?? p?.cost ?? 0); // в конфиге это "рубли"
+  row.cost_cent = toCostCentFromMajor(major);   // в D1 это "копейки"
+}
       if (wheelCols.has("cost_currency")) row.cost_currency = String(p?.cost_currency ?? p?.currency ?? "RUB");
       if (wheelCols.has("cost_currency_custom")) row.cost_currency_custom = String(p?.cost_currency_custom ?? p?.currency_custom ?? "");
 
