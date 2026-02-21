@@ -83,6 +83,21 @@ if (wheel) {
         // visual
         img: pr?.img ? String(pr.img) : "",
 
+        // ✅ NEW: себестоимость приза в МОНЕТАХ (для item)
+  cost_coins: (kind === "item" && Number.isFinite(costCoinsRaw))
+    ? Math.max(0, Math.round(costCoinsRaw))
+    : 0,
+
+  // (пока оставляем как было — ниже ты решишь, выпиливаем ли cost_cent/currency полностью)
+  cost_cent: (kind === "item" && Number.isFinite(costCentRaw)) ? Math.max(0, Math.round(costCentRaw)) : 0,
+  cost_currency: String(pr?.cost_currency ?? pr?.currency ?? "RUB"),
+  cost_currency_custom: String(pr?.cost_currency_custom ?? pr?.currency_custom ?? ""),
+
+  track_qty: (kind === "item") ? !!trackQty : false,
+  qty_left: (kind === "item" && Number.isFinite(qtyLeftRaw)) ? Math.max(0, Math.round(qtyLeftRaw)) : 0,
+  stop_when_zero: (kind === "item") ? !!stopWhenZero : true,
+};
+
         // economics / inventory (item only)
         cost_cent: (kind === "item" && Number.isFinite(costCentRaw)) ? Math.max(0, Math.round(costCentRaw)) : 0,
         cost_currency: String(pr?.cost_currency ?? pr?.currency ?? "RUB"),
