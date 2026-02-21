@@ -34,6 +34,7 @@ const json = (obj: any, status = 200, request: Request | null = null) =>
   jsonResponse(obj, status, request as any);
 
 // ===== app_settings helper (coin value / currency) =====
+
 async function getAppSettingsForPublicId(env: Env, appPublicId: string){
   try{
     const row = await env.DB.prepare(
@@ -64,7 +65,6 @@ async function getTableCols(db: any, table: string): Promise<Set<string>> {
 }
 
 // CABINET: WHEEL STATS (PRIZE TABLE)
-
 export async function handleCabinetWheelStats(appId, request, env, ownerId){
   const url = new URL(request.url);
 
@@ -85,6 +85,9 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
   }
 
   const db = env.DB;
+  const s = await getAppSettingsForPublicId(env, appPublicId);
+  const coinValueCents = Math.max(1, Number(s.coin_value_cents || 100));
+  const currency = String(s.currency || 'RUB');
 
   const rows = await db.prepare(`
     WITH agg AS (
@@ -111,8 +114,8 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
       p.coins AS coins,
       p.img AS img,
 
-      p.cost_cent AS cost_cent,
-      p.cost_currency AS cost_currency,
+      -- ✅ new: cost in coins
+      p.cost_coins AS cost_coins,
 
       p.track_qty AS track_qty,
       p.qty_left AS qty_left,
@@ -126,26 +129,37 @@ export async function handleCabinetWheelStats(appId, request, env, ownerId){
     appId, appPublicId
   ).all();
 
-  const items = (rows?.results || []).map(r => ({
-    prize_code: String(r.prize_code || ''),
-    title: String(r.title || ''),
-    wins: Number(r.wins || 0),
-    redeemed: Number(r.redeemed || 0),
+  // ✅ back-compat for твоего Wheel.tsx: отдаем cost_cent/cost_currency,
+  // но считаем их из cost_coins * coin_value_cents (текущих настроек).
+  const items = (rows?.results || []).map(r => {
+    const cost_coins = Number(r.cost_coins ?? 0);
+    const cost_cent = Math.max(0, Math.floor(cost_coins * coinValueCents));
 
-    weight: Number(r.weight ?? 0),
-    active: Number(r.active ?? 0) ? 1 : 0,
+    return {
+      prize_code: String(r.prize_code || ''),
+      title: String(r.title || ''),
+      wins: Number(r.wins || 0),
+      redeemed: Number(r.redeemed || 0),
 
-    kind: String(r.kind || ''),
-    coins: Number(r.coins ?? 0),
-    img: r.img ?? null,
+      weight: Number(r.weight ?? 0),
+      active: Number(r.active ?? 0) ? 1 : 0,
 
-    cost_cent: Number(r.cost_cent ?? 0),
-    cost_currency: String(r.cost_currency || ''),
+      kind: String(r.kind || ''),
+      coins: Number(r.coins ?? 0),
+      img: r.img ?? null,
 
-    track_qty: Number(r.track_qty ?? 0) ? 1 : 0,
-    qty_left: (r.qty_left === null || r.qty_left === undefined) ? null : Number(r.qty_left),
-    stop_when_zero: Number(r.stop_when_zero ?? 0) ? 1 : 0,
-  }));
+      // new (source of truth)
+      cost_coins,
+
+      // legacy for UI
+      cost_cent,
+      cost_currency: currency,
+
+      track_qty: Number(r.track_qty ?? 0) ? 1 : 0,
+      qty_left: (r.qty_left === null || r.qty_left === undefined) ? null : Number(r.qty_left),
+      stop_when_zero: Number(r.stop_when_zero ?? 0) ? 1 : 0,
+    };
+  });
 
   return json({ ok:true, items }, 200, request);
 }
@@ -171,6 +185,11 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
 
   const db = env.DB;
 
+  // ✅ IMPORTANT:
+  // history must be computed from SNAPSHOTS in wheel_spins:
+  // - coin_value_cents
+  // - prize_cost_coins
+  // (and prize_coins for coins-prize)
   const rows = await db.prepare(`
     SELECT
       substr(ts_created, 1, 10) AS date,
@@ -181,24 +200,24 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
       SUM(CASE WHEN ts_issued   IS NOT NULL THEN 1 ELSE 0 END) AS wins,
       SUM(CASE WHEN ts_redeemed IS NOT NULL THEN 1 ELSE 0 END) AS redeemed,
 
-      -- money snapshots (cents): revenue per spin = spin_cost * coin_value_cents at that moment
+      -- revenue snapshot: spin_cost * coin_value_cents (at that moment)
       COALESCE(SUM(COALESCE(spin_cost,0) * COALESCE(coin_value_cents,0)), 0) AS revenue_cents,
 
-      -- payout issued: for wins only
+      -- payout issued: for wins only (use snapshots)
       COALESCE(SUM(
         CASE
           WHEN ts_issued IS NULL THEN 0
           WHEN prize_kind = 'coins' THEN COALESCE(prize_coins,0) * COALESCE(coin_value_cents,0)
-          ELSE COALESCE(prize_cost_cent,0)
+          ELSE COALESCE(prize_cost_coins,0) * COALESCE(coin_value_cents,0)
         END
       ), 0) AS payout_issued_cents,
 
-      -- payout redeemed: for redeemed only
+      -- payout redeemed: for redeemed only (use snapshots)
       COALESCE(SUM(
         CASE
           WHEN ts_redeemed IS NULL THEN 0
           WHEN prize_kind = 'coins' THEN COALESCE(prize_coins,0) * COALESCE(coin_value_cents,0)
-          ELSE COALESCE(prize_cost_cent,0)
+          ELSE COALESCE(prize_cost_coins,0) * COALESCE(coin_value_cents,0)
         END
       ), 0) AS payout_redeemed_cents
 
@@ -232,7 +251,7 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
     };
   });
 
-  // back-compat (для UI; но НЕ используем для пересчётов истории)
+  // UI settings (only for formatting in cabinet)
   const settings = await getAppSettingsForPublicId(env, appPublicId);
 
   // cumulative
@@ -841,16 +860,18 @@ export async function handleCabinetWheelPrizesUpdate(appId, request, env, ownerI
 
   const cols = await getTableCols(env.DB, "wheel_prizes");
 
-  // разрешённые live-поля (меняем из аналитики без publish)
+  // LIVE fields: меняем из аналитики/тюнинга без publish
   const allowed = new Set([
-    "weight",
     "active",
-    "cost_cent",
-    "cost_currency",
-    "cost_currency_custom",
     "track_qty",
     "qty_left",
     "stop_when_zero",
+
+    // optional: allow tweak weight here too (sometimes handy)
+    "weight",
+
+    // ✅ new: cost in coins (if you want tweak here too)
+    "cost_coins",
   ]);
 
   let updated = 0;
@@ -870,28 +891,17 @@ export async function handleCabinetWheelPrizesUpdate(appId, request, env, ownerI
       vals.push(v);
     }
 
-    // active: 0/1
     if (it.active !== undefined){
       setIf("active", toInt(it.active, 1) ? 1 : 0);
     }
-
-    // weight: int basis points (как у тебя уже принято)
     if (it.weight !== undefined){
       setIf("weight", Math.max(0, toInt(it.weight, 0)));
     }
 
-    // cost_cent: ALWAYS cents (we fixed this globally)
-    if (it.cost_cent !== undefined){
-      setIf("cost_cent", Math.max(0, toInt(it.cost_cent, 0)));
-    }
-    if (it.cost_currency !== undefined){
-      setIf("cost_currency", String(it.cost_currency || "RUB"));
-    }
-    if (it.cost_currency_custom !== undefined){
-      setIf("cost_currency_custom", String(it.cost_currency_custom || ""));
+    if (it.cost_coins !== undefined){
+      setIf("cost_coins", Math.max(0, toInt(it.cost_coins, 0)));
     }
 
-    // inventory
     if (it.track_qty !== undefined){
       setIf("track_qty", toInt(it.track_qty, 0) ? 1 : 0);
     }
@@ -904,7 +914,6 @@ export async function handleCabinetWheelPrizesUpdate(appId, request, env, ownerI
 
     if (!sets.length) continue;
 
-    // optional updated_at
     if (cols.has("updated_at")){
       sets.push(`updated_at = datetime('now')`);
     }
