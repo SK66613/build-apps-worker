@@ -25,7 +25,6 @@ function randomRedeemCodeLocal(len = 10) {
 
 async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number | null> {
   try {
-    // берём стабильное значение даже если вдруг где-то рассинк: MAX()
     const row: any = await db
       .prepare(`SELECT MAX(spin_cost) AS spin_cost FROM wheel_prizes WHERE app_public_id=?`)
       .bind(appPublicId)
@@ -35,7 +34,6 @@ async function getSpinCostFromDb(db: any, appPublicId: string): Promise<number |
     return Number.isFinite(v) ? Math.max(0, Math.floor(v)) : null;
   } catch (e: any) {
     const msg = String(e?.message || e);
-    // если колонки нет — просто fallback на cfg
     if (/no such column:\s*spin_cost/i.test(msg)) return null;
     return null;
   }
@@ -66,9 +64,14 @@ type PrizeRow = {
   coins: number;
   active: number;
 
-  // optional new columns (may not exist on older DB)
+  // optional columns
   img?: string;
   kind?: string;
+
+  // NEW economics
+  cost_coins?: number;
+
+  // legacy economics (если у тебя ещё есть/нужно)
   cost_cent?: number;
   cost_currency?: string;
 
@@ -109,13 +112,15 @@ function pickWeighted(list: PrizeRow[]) {
   return items[items.length - 1].p;
 }
 
-// Load prizes. Backward compatible with older schema (no img/cost/qty).
+// Load prizes. Backward compatible with older schema.
 async function loadWheelPrizes(db: any, appPublicId: string): Promise<PrizeRow[]> {
   try {
     const rows: any = await db
       .prepare(
         `SELECT code, title, weight, coins, active,
-                img, kind, cost_cent, cost_currency,
+                img, kind,
+                cost_coins,
+                cost_cent, cost_currency,
                 track_qty, qty_left, stop_when_zero
          FROM wheel_prizes
          WHERE app_public_id = ?`
@@ -132,7 +137,10 @@ async function loadWheelPrizes(db: any, appPublicId: string): Promise<PrizeRow[]
 
       img: (r.img ?? "") || "",
       kind: (r.kind ?? "") || "",
-      cost_cent: Number(r.cost_cent || 0),
+
+      cost_coins: Number(r.cost_coins ?? 0),
+
+      cost_cent: Number(r.cost_cent ?? 0),
       cost_currency: r.cost_currency ? String(r.cost_currency) : undefined,
 
       track_qty: Number(r.track_qty || 0),
@@ -142,8 +150,10 @@ async function loadWheelPrizes(db: any, appPublicId: string): Promise<PrizeRow[]
   } catch (e: any) {
     const msg = String(e?.message || e);
 
-    // Old schema fallback
-    if (/no such column:\s*(img|kind|cost_cent|cost_currency|track_qty|qty_left|stop_when_zero)/i.test(msg)) {
+    // fallback if some columns are missing
+    if (
+      /no such column:\s*(img|kind|cost_coins|cost_cent|cost_currency|track_qty|qty_left|stop_when_zero)/i.test(msg)
+    ) {
       const rows: any = await db
         .prepare(`SELECT code, title, weight, coins, active FROM wheel_prizes WHERE app_public_id = ?`)
         .bind(appPublicId)
@@ -168,7 +178,10 @@ async function getWheelPrizeDetails(db: any, appPublicId: string, prizeCode: str
   try {
     return await db
       .prepare(
-        `SELECT coins, img, kind, cost_cent, cost_currency, track_qty, qty_left, stop_when_zero
+        `SELECT coins, img, kind,
+                cost_coins,
+                cost_cent, cost_currency,
+                track_qty, qty_left, stop_when_zero
          FROM wheel_prizes
          WHERE app_public_id=? AND code=? LIMIT 1`
       )
@@ -176,7 +189,9 @@ async function getWheelPrizeDetails(db: any, appPublicId: string, prizeCode: str
       .first();
   } catch (e: any) {
     const msg = String(e?.message || e);
-    if (/no such column:\s*(img|kind|cost_cent|cost_currency|track_qty|qty_left|stop_when_zero)/i.test(msg)) {
+    if (
+      /no such column:\s*(img|kind|cost_coins|cost_cent|cost_currency|track_qty|qty_left|stop_when_zero)/i.test(msg)
+    ) {
       const fallback: any = await db
         .prepare(`SELECT coins FROM wheel_prizes WHERE app_public_id=? AND code=? LIMIT 1`)
         .bind(appPublicId, prizeCode)
@@ -186,8 +201,11 @@ async function getWheelPrizeDetails(db: any, appPublicId: string, prizeCode: str
         coins: Number(fallback?.coins || 0),
         img: "",
         kind: null,
+
+        cost_coins: 0,
         cost_cent: 0,
         cost_currency: null,
+
         track_qty: 0,
         qty_left: null,
         stop_when_zero: 1,
@@ -198,10 +216,6 @@ async function getWheelPrizeDetails(db: any, appPublicId: string, prizeCode: str
 }
 
 // Reserve 1 item at "issued".
-// Rules:
-// - if track_qty=0 => no reserve
-// - if stop_when_zero=1 => must have qty_left>0
-// - if stop_when_zero=0 => allow reserve even when qty_left<=0 (but we don't decrement below 0)
 async function reserveOneIfNeeded(db: any, appPublicId: string, prizeCode: string, prRow: any): Promise<boolean> {
   const track = Number(prRow?.track_qty || 0) === 1;
   if (!track) return true;
@@ -236,7 +250,6 @@ async function reserveOneIfNeeded(db: any, appPublicId: string, prizeCode: strin
   }
 }
 
-// ---- WheelArgs (если у тебя этот тип уже импортится в другом месте — можно удалить этот блок)
 export type WheelArgs = {
   request: Request;
   env: Env;
@@ -253,7 +266,6 @@ export type WheelArgs = {
 export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | null> {
   const { request, db, type, payload, tg, ctx, buildState, spendCoinsIfEnough, awardCoins } = args;
 
-  // cfg нужен в нескольких ветках — реально читаем из payload
   let cfg: any =
     (payload as any)?.cfg ??
     (payload as any)?.config ??
@@ -261,13 +273,13 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     (payload as any)?.state ??
     {};
 
-  // ====== wheel.spin (bonus_wheel_one)
+  // ====== wheel.spin
   if (type === "wheel.spin" || type === "wheel_spin" || type === "spin") {
     const route = "wheel.spin";
     const appPublicId = String((ctx as any).publicId || "");
     const tgUserId = String(tg?.id || "");
 
-    // Spin cost: prefer D1 (wheel_prizes.spin_cost), fallback to cfg (KV) if empty/no column
+    // Spin cost
     const spinCostFromDb = await getSpinCostFromDb(db, appPublicId);
     const spinCostFromCfg = Math.max(
       0,
@@ -275,7 +287,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     );
     const spinCost = spinCostFromDb !== null ? spinCostFromDb : spinCostFromCfg;
 
-    // coin value cents (snapshot): prefer app_settings (D1), fallback cfg
+    // coin value cents snapshot
     const coinValueCentsFromDb = await getCoinValueCentsFromDb(db, appPublicId);
     const coinValueCentsFromCfg = Math.max(
       0,
@@ -324,7 +336,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
       return json({ ok: false, error: "SPIN_CREATE_FAILED" }, 500, request);
     }
 
-    // 2) spend coins for spin (ledger-safe)
+    // 2) spend coins for spin
     if (spinCost > 0) {
       const spend: any = await spendCoinsIfEnough(
         db,
@@ -360,7 +372,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
       }
     }
 
-    // 3) load prizes + pick + reserve (issued reserve)
+    // 3) load prizes + pick + reserve
     let prizes: PrizeRow[] = [];
     try {
       prizes = await loadWheelPrizes(db, (ctx as any).publicId);
@@ -385,7 +397,6 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
       }));
 
     if (!baseList.length) {
-      // refund if no prizes
       if (spinCost > 0) {
         await awardCoins(
           db,
@@ -415,7 +426,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
       return json({ ok: false, error: "NO_PRIZES" }, 400, request);
     }
 
-    // pick & reserve with retries to handle race on last item
+    // pick & reserve with retries
     let prize: PrizeRow | null = null;
     let prDetails: any = null;
 
@@ -468,19 +479,21 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     const prizeCoins = Math.max(0, Math.floor(Number(prDetails?.coins ?? prize.coins ?? 0)));
     const prizeImg = String((prDetails?.img ?? prize.img ?? "") || "");
 
-    // kind: auto-award coins ONLY when kind explicitly "coins"
     const kindRaw = String((prDetails?.kind ?? prize.kind ?? "") || "").trim().toLowerCase();
     const kind = kindRaw === "coins" ? "coins" : "item";
-
-    // ===== snapshots for wheel_spins analytics =====
     const prizeKind = String(kind || "item");
 
-    // себестоимость вещи (только для item). Для coins можно оставить 0, чтобы не путать.
+    // ✅ NEW snapshots: prize_cost_coins + coin_value_cents
+    const prizeCostCoins =
+      prizeKind === "coins"
+        ? 0
+        : Math.max(0, Math.floor(Number(prDetails?.cost_coins ?? (prize as any).cost_coins ?? 0)));
+
+    // legacy (пока оставим, но если выпиливаешь — можешь потом убрать совсем)
     const prizeCostCent =
       prizeKind === "coins"
         ? 0
         : Math.max(0, Math.floor(Number(prDetails?.cost_cent ?? (prize as any).cost_cent ?? 0)));
-
     const prizeCostCurrencyRaw = prDetails?.cost_currency ?? (prize as any).cost_currency ?? "RUB";
     const prizeCostCurrency = prizeCostCurrencyRaw ? String(prizeCostCurrencyRaw) : "RUB";
 
@@ -526,6 +539,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
         return json({ ok: false, error: "AWARD_COINS_FAILED" }, 500, request);
       }
 
+      // write snapshots (best-effort if columns exist)
       await db
         .prepare(
           `UPDATE wheel_spins
@@ -539,6 +553,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
                prize_cost_cent=?,
                prize_cost_currency=?,
                coin_value_cents=?,
+               prize_cost_coins=?,
 
                ts_issued=datetime('now'),
                ts_redeemed=datetime('now'),
@@ -555,13 +570,14 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
           prizeCostCent,
           prizeCostCurrency,
           coinValueCents,
+          prizeCostCoins,
 
           String(tgUserId),
           spinId
         )
         .run()
         .catch(async () => {
-          // fallback for older schema
+          // fallback for older schema (no new columns)
           await db
             .prepare(
               `UPDATE wheel_spins
@@ -575,14 +591,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
                    redeemed_by_tg=?
                WHERE id=?`
             )
-            .bind(
-              String(prize.code || ""),
-              String(prize.title || ""),
-              prizeCoins,
-              spinCost,
-              String(tgUserId),
-              spinId
-            )
+            .bind(String(prize.code || ""), String(prize.title || ""), prizeCoins, spinCost, String(tgUserId), spinId)
             .run()
             .catch(() => null);
         });
@@ -604,35 +613,21 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
       );
     }
 
-    // ===== cost calc (for analytics / profit) =====
-    const coinCostCent = Math.max(
-      0,
-      Math.floor(
-        Number((cfg as any)?.coins?.cost_cent_per_coin ?? (cfg as any)?.wheel?.coin_cost_cent ?? 0)
-      )
-    );
-
-    const costCent =
-      kind === "coins"
-        ? prizeCoins * coinCostCent
-        : Math.max(0, Math.floor(Number(prDetails?.cost_cent ?? (prize as any).cost_cent ?? 0)));
-
-    const costCurrencyRaw = prDetails?.cost_currency ?? (prize as any).cost_currency ?? "RUB";
-    const costCurrency = costCurrencyRaw ? String(costCurrencyRaw) : null;
-
     // ===== 5) issue redeem (wheel_redeems) =====
     let redeem: any = null;
     for (let i = 0; i < 5; i++) {
       const redeemCode = randomRedeemCodeLocal(10);
       try {
+        // ✅ вставляем cost_coins; legacy cost_cent/currency оставляем (если колонки есть)
         const ins2 = await db
           .prepare(
             `INSERT INTO wheel_redeems
                (app_id, app_public_id, tg_id, spin_id, prize_code, prize_title,
                 redeem_code, status, issued_at, img, expires_at,
                 kind, coins,
+                cost_coins,
                 cost_cent, cost_currency)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?, NULL, ?, ?, ?, ?)`
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?, NULL, ?, ?, ?, ?, ?)`
           )
           .bind(
             (ctx as any).appId,
@@ -647,8 +642,10 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
             String(kind || "item"),
             Number.isFinite(Number(prizeCoins)) ? Math.max(0, Math.floor(Number(prizeCoins))) : 0,
 
-            costCent,
-            costCurrency
+            prizeCostCoins, // ✅ main live economics
+
+            prizeCostCent, // legacy
+            prizeCostCurrency // legacy
           )
           .run();
 
@@ -659,6 +656,54 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
         break;
       } catch (e: any) {
         const msg = String(e?.message || e);
+
+        // schema fallback (если нет cost_coins / legacy колонок)
+        if (/no such column:\s*cost_coins/i.test(msg)) {
+          try {
+            const ins2 = await db
+              .prepare(
+                `INSERT INTO wheel_redeems
+                   (app_id, app_public_id, tg_id, spin_id, prize_code, prize_title,
+                    redeem_code, status, issued_at, img, expires_at,
+                    kind, coins)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'), ?, NULL, ?, ?)`
+              )
+              .bind(
+                (ctx as any).appId,
+                appPublicId,
+                tgUserId,
+                spinId,
+                String(prize.code || ""),
+                String(prize.title || ""),
+                redeemCode,
+                prizeImg,
+                String(kind || "item"),
+                Number.isFinite(Number(prizeCoins)) ? Math.max(0, Math.floor(Number(prizeCoins))) : 0
+              )
+              .run();
+
+            redeem = {
+              id: Number((ins2 as any)?.meta?.last_row_id || (ins2 as any)?.lastInsertRowid || 0),
+              redeem_code: redeemCode,
+            };
+            break;
+          } catch (e2: any) {
+            const msg2 = String(e2?.message || e2);
+            if (!/unique|constraint/i.test(msg2)) {
+              logWheelEvent({
+                code: "mini.wheel.spin.fail.db_error",
+                msg: "Failed to issue reward (fallback)",
+                appPublicId,
+                tgUserId,
+                route,
+                extra: { spinId, error: msg2 },
+              });
+              return json({ ok: false, error: "REDEEM_CREATE_FAILED" }, 500, request);
+            }
+            continue;
+          }
+        }
+
         if (!/unique|constraint/i.test(msg)) {
           logWheelEvent({
             code: "mini.wheel.spin.fail.db_error",
@@ -701,6 +746,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
                prize_cost_cent=?,
                prize_cost_currency=?,
                coin_value_cents=?,
+               prize_cost_coins=?,
 
                ts_issued=datetime('now')
            WHERE id=?`
@@ -716,6 +762,7 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
           prizeCostCent,
           prizeCostCurrency,
           coinValueCents,
+          prizeCostCoins,
 
           spinId
         )
@@ -815,40 +862,86 @@ export async function handleWheelMiniApi(args: WheelArgs): Promise<Response | nu
     const tgUserId = String(tg?.id || "");
 
     try {
-      const rows: any = await db
-        .prepare(
-          `SELECT id, prize_code, prize_title, redeem_code, status,
-                  issued_at, img, expires_at, cost_cent, cost_currency
-           FROM wheel_redeems
-           WHERE app_public_id=? AND tg_id=? AND status='issued'
-           ORDER BY id DESC`
-        )
-        .bind(appPublicId, tgUserId)
-        .all();
+      // пробуем с cost_coins, если колонки нет — fallback
+      try {
+        const rows: any = await db
+          .prepare(
+            `SELECT id, prize_code, prize_title, redeem_code, status,
+                    issued_at, img, expires_at,
+                    cost_coins,
+                    cost_cent, cost_currency
+             FROM wheel_redeems
+             WHERE app_public_id=? AND tg_id=? AND status='issued'
+             ORDER BY id DESC`
+          )
+          .bind(appPublicId, tgUserId)
+          .all();
 
-      const rewards = (rows?.results || []).map((r: any) => ({
-        id: Number(r.id || 0),
-        prize_code: String(r.prize_code || ""),
-        prize_title: String(r.prize_title || ""),
-        redeem_code: String(r.redeem_code || ""),
-        status: String(r.status || "issued"),
-        issued_at: r.issued_at || null,
-        img: r.img || "",
-        expires_at: r.expires_at || null,
-        cost_cent: Math.max(0, Number(r.cost_cent || 0)),
-        cost_currency: r.cost_currency || null,
-      }));
+        const rewards = (rows?.results || []).map((r: any) => ({
+          id: Number(r.id || 0),
+          prize_code: String(r.prize_code || ""),
+          prize_title: String(r.prize_title || ""),
+          redeem_code: String(r.redeem_code || ""),
+          status: String(r.status || "issued"),
+          issued_at: r.issued_at || null,
+          img: r.img || "",
+          expires_at: r.expires_at || null,
 
-      logWheelEvent({
-        code: "mini.wheel.rewards.ok",
-        msg: "Rewards fetched",
-        appPublicId,
-        tgUserId,
-        route,
-        extra: { rewards_count: rewards.length },
-      });
+          cost_coins: Math.max(0, Number(r.cost_coins ?? 0)),
 
-      return json({ ok: true, rewards, rewards_count: rewards.length }, 200, request);
+          // legacy
+          cost_cent: Math.max(0, Number(r.cost_cent ?? 0)),
+          cost_currency: r.cost_currency || null,
+        }));
+
+        logWheelEvent({
+          code: "mini.wheel.rewards.ok",
+          msg: "Rewards fetched",
+          appPublicId,
+          tgUserId,
+          route,
+          extra: { rewards_count: rewards.length },
+        });
+
+        return json({ ok: true, rewards, rewards_count: rewards.length }, 200, request);
+      } catch (e0: any) {
+        const msg0 = String(e0?.message || e0);
+        if (!/no such column:\s*cost_coins/i.test(msg0)) throw e0;
+
+        const rows: any = await db
+          .prepare(
+            `SELECT id, prize_code, prize_title, redeem_code, status,
+                    issued_at, img, expires_at
+             FROM wheel_redeems
+             WHERE app_public_id=? AND tg_id=? AND status='issued'
+             ORDER BY id DESC`
+          )
+          .bind(appPublicId, tgUserId)
+          .all();
+
+        const rewards = (rows?.results || []).map((r: any) => ({
+          id: Number(r.id || 0),
+          prize_code: String(r.prize_code || ""),
+          prize_title: String(r.prize_title || ""),
+          redeem_code: String(r.redeem_code || ""),
+          status: String(r.status || "issued"),
+          issued_at: r.issued_at || null,
+          img: r.img || "",
+          expires_at: r.expires_at || null,
+          cost_coins: 0,
+        }));
+
+        logWheelEvent({
+          code: "mini.wheel.rewards.ok",
+          msg: "Rewards fetched (fallback)",
+          appPublicId,
+          tgUserId,
+          route,
+          extra: { rewards_count: rewards.length },
+        });
+
+        return json({ ok: true, rewards, rewards_count: rewards.length }, 200, request);
+      }
     } catch (e: any) {
       logWheelEvent({
         code: "mini.wheel.rewards.fail.db_error",
