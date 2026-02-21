@@ -55,6 +55,14 @@ async function getAppSettingsForPublicId(env: Env, appPublicId: string){
   }
 }
 
+// ===== helper: table columns =====
+async function getTableCols(db: any, table: string): Promise<Set<string>> {
+  const res: any = await db.prepare(`PRAGMA table_info(${table})`).all();
+  const cols = new Set<string>();
+  for (const r of (res?.results || [])) cols.add(String(r.name || ""));
+  return cols;
+}
+
 // CABINET: WHEEL STATS (PRIZE TABLE)
 
 export async function handleCabinetWheelStats(appId, request, env, ownerId){
@@ -243,7 +251,6 @@ export async function handleCabinetWheelTimeseries(appId, request, env, ownerId)
     days
   }, 200, request);
 }
-
 
 export async function handleCabinetSummary(appId, request, env, ownerId){
   const publicId = await getCanonicalPublicIdForApp(appId, env);
@@ -827,35 +834,89 @@ export async function handleCabinetWheelPrizesUpdate(appId, request, env, ownerI
     return json({ ok:false, error:'NO_ITEMS' }, 400, request);
   }
 
-  const norm = [];
-  for (const it of items){
-    const code = String(it?.prize_code || it?.code || '').trim();
-    if (!code) continue;
-
-    const weight = Math.max(0, toInt(it.weight, 0));
-    const active = toInt(it.active, 1) ? 1 : 0;
-
-    norm.push({ code, weight, active });
-  }
-
-  if (!norm.length){
-    return json({ ok:false, error:'NO_VALID_ITEMS' }, 400, request);
-  }
-
   const appPublicId = await getCanonicalPublicIdForApp(appId, env);
   if (!appPublicId){
     return json({ ok:false, error:'APP_PUBLIC_ID_NOT_FOUND' }, 404, request);
   }
 
+  const cols = await getTableCols(env.DB, "wheel_prizes");
+
+  // разрешённые live-поля (меняем из аналитики без publish)
+  const allowed = new Set([
+    "weight",
+    "active",
+    "cost_cent",
+    "cost_currency",
+    "cost_currency_custom",
+    "track_qty",
+    "qty_left",
+    "stop_when_zero",
+  ]);
+
   let updated = 0;
 
-  for (const it of norm){
+  for (const it of items){
+    const code = String(it?.prize_code || it?.code || '').trim();
+    if (!code) continue;
+
+    const sets: string[] = [];
+    const vals: any[] = [];
+
+    function setIf(name: string, v: any){
+      if (!allowed.has(name)) return;
+      if (!cols.has(name)) return;
+      if (v === undefined) return; // undefined = не трогаем поле
+      sets.push(`${name} = ?`);
+      vals.push(v);
+    }
+
+    // active: 0/1
+    if (it.active !== undefined){
+      setIf("active", toInt(it.active, 1) ? 1 : 0);
+    }
+
+    // weight: int basis points (как у тебя уже принято)
+    if (it.weight !== undefined){
+      setIf("weight", Math.max(0, toInt(it.weight, 0)));
+    }
+
+    // cost_cent: ALWAYS cents (we fixed this globally)
+    if (it.cost_cent !== undefined){
+      setIf("cost_cent", Math.max(0, toInt(it.cost_cent, 0)));
+    }
+    if (it.cost_currency !== undefined){
+      setIf("cost_currency", String(it.cost_currency || "RUB"));
+    }
+    if (it.cost_currency_custom !== undefined){
+      setIf("cost_currency_custom", String(it.cost_currency_custom || ""));
+    }
+
+    // inventory
+    if (it.track_qty !== undefined){
+      setIf("track_qty", toInt(it.track_qty, 0) ? 1 : 0);
+    }
+    if (it.qty_left !== undefined){
+      setIf("qty_left", Math.max(0, toInt(it.qty_left, 0)));
+    }
+    if (it.stop_when_zero !== undefined){
+      setIf("stop_when_zero", toInt(it.stop_when_zero, 0) ? 1 : 0);
+    }
+
+    if (!sets.length) continue;
+
+    // optional updated_at
+    if (cols.has("updated_at")){
+      sets.push(`updated_at = datetime('now')`);
+    }
+
+    vals.push(appPublicId, code);
+
     const res = await env.DB.prepare(`
       UPDATE wheel_prizes
-      SET weight = ?, active = ?
+      SET ${sets.join(", ")}
       WHERE app_public_id = ?
         AND code = ?
-    `).bind(it.weight, it.active, appPublicId, it.code).run();
+    `).bind(...vals).run();
 
     if (res?.meta?.changes){
       updated += res.meta.changes;
