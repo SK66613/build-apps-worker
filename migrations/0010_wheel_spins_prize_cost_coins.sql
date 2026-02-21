@@ -3,5 +3,5 @@
 -- In SQLite, simplest is ALTER TABLE; if column exists, Wrangler would fail.
 -- So: use a "manual idempotent" approach: check first in CI OR keep this migration only if not applied yet.
 
-ALTER TABLE wheel_spins ADD COLUMN prize_cost_coins INTEGER DEFAULT 0;
+-- ALTER TABLE wheel_spins ADD COLUMN prize_cost_coins INTEGER DEFAULT 0;
 
