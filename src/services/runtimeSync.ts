@@ -1,10 +1,10 @@
 // src/services/runtimeSync.ts
 // Sync runtime lookup tables (wheel_prizes, styles_dict) from runtime config.
 //
-// Variant A:
-// - D1 wheel_prizes is source of truth for live fields (weight/active/cost/qty/...)
-// - publish MUST NOT wipe or overwrite live fields
-// - publish updates ONLY structure fields (title/kind/coins/img/spin_cost)
+// Variant A (compromise):
+// - D1 wheel_prizes is source of truth for LIVE fields (active/qty/stop/track...)
+// - publish MUST NOT wipe live fields
+// - publish updates ONLY structure fields (title/kind/coins/img/weight/cost_coins)
 // - new prizes are INSERTed with defaults once (INSERT OR IGNORE)
 
 import type { Env } from "../index";
@@ -14,6 +14,12 @@ async function getTableCols(db: any, table: string): Promise<Set<string>> {
   const cols = new Set<string>();
   for (const r of (res?.results || [])) cols.add(String(r.name || ""));
   return cols;
+}
+
+function toInt(v: any, d = 0) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return d;
+  return Math.trunc(n);
 }
 
 export async function syncRuntimeTablesFromConfig(
@@ -31,7 +37,7 @@ export async function syncRuntimeTablesFromConfig(
     const wheelCols = await getTableCols(db, "wheel_prizes");
 
     // wheel spin cost (store in D1 if column exists)
-    const spinCost = Math.max(0, Math.floor(Number(cfg?.wheel?.spin_cost ?? 0)));
+    const spinCost = Math.max(0, toInt(cfg?.wheel?.spin_cost ?? 0, 0));
 
     // IMPORTANT: NO DELETE here (publish must not reset live fields)
     const prizes = cfg?.wheel && Array.isArray(cfg.wheel.prizes) ? cfg.wheel.prizes : [];
@@ -51,29 +57,29 @@ export async function syncRuntimeTablesFromConfig(
 
       // structure-ish columns
       if (wheelCols.has("kind")) insertRow.kind = String(p?.kind || "");
-      if (wheelCols.has("coins")) insertRow.coins = Math.max(0, Math.round(Number(p?.coins || 0)));
+      if (wheelCols.has("coins")) insertRow.coins = Math.max(0, toInt(p?.coins || 0, 0));
       if (wheelCols.has("img")) insertRow.img = p?.img ? String(p.img) : null;
+
+      // ✅ structure (from editor): weight
+      if (wheelCols.has("weight")) insertRow.weight = Math.max(0, toInt(p?.weight || 0, 0));
+
+      // ✅ structure (from editor): себестоимость физ. приза в монетах
+      // (для coins-приза можно 0 — не используется)
+      if (wheelCols.has("cost_coins")) insertRow.cost_coins = Math.max(0, toInt(p?.cost_coins ?? 0, 0));
 
       // live defaults (ONLY on first insert; publish will not update them later)
       if (wheelCols.has("active")) insertRow.active = p?.active === false ? 0 : 1;
-      if (wheelCols.has("weight")) insertRow.weight = Math.max(0, Math.round(Number(p?.weight || 0)));
 
-      // economics/inventory are LIVE in variant A
-      // NOTE: cost_cent is already in cents (we fixed this globally)
-      if (wheelCols.has("cost_cent"))
-        insertRow.cost_cent = Math.max(0, Math.round(Number(p?.cost_cent ?? p?.cost ?? 0)));
-      if (wheelCols.has("cost_currency"))
-        insertRow.cost_currency = String(p?.cost_currency ?? p?.currency ?? "RUB");
-      if (wheelCols.has("cost_currency_custom"))
-        insertRow.cost_currency_custom = String(p?.cost_currency_custom ?? p?.currency_custom ?? "");
-
+      // inventory fields are LIVE (not overwritten on publish)
       if (wheelCols.has("track_qty"))
         insertRow.track_qty =
           p?.track_qty === true || Number(p?.track_qty || 0) === 1 ? 1 : 0;
+
       if (wheelCols.has("qty_left")) {
         const q = p?.qty_left ?? p?.stock_qty ?? 0;
-        insertRow.qty_left = Math.max(0, Math.round(Number(q || 0)));
+        insertRow.qty_left = Math.max(0, toInt(q || 0, 0));
       }
+
       if (wheelCols.has("stop_when_zero")) {
         const swz = p?.stop_when_zero === undefined ? true : !!p.stop_when_zero;
         insertRow.stop_when_zero = swz ? 1 : 0;
@@ -114,11 +120,23 @@ export async function syncRuntimeTablesFromConfig(
         }
         if (wheelCols.has("coins")) {
           sets.push(`coins = ?`);
-          vals.push(Math.max(0, Math.round(Number(p?.coins || 0))));
+          vals.push(Math.max(0, toInt(p?.coins || 0, 0)));
         }
         if (wheelCols.has("img")) {
           sets.push(`img = ?`);
           vals.push(p?.img ? String(p.img) : null);
+        }
+
+        // ✅ weight from editor (structure)
+        if (wheelCols.has("weight")) {
+          sets.push(`weight = ?`);
+          vals.push(Math.max(0, toInt(p?.weight || 0, 0)));
+        }
+
+        // ✅ cost_coins from editor (structure)
+        if (wheelCols.has("cost_coins")) {
+          sets.push(`cost_coins = ?`);
+          vals.push(Math.max(0, toInt(p?.cost_coins ?? 0, 0)));
         }
 
         vals.push(publicId, code);
