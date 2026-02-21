@@ -4,3 +4,4 @@
 -- So: use a "manual idempotent" approach: check first in CI OR keep this migration only if not applied yet.
 
 ALTER TABLE wheel_spins ADD COLUMN prize_cost_coins INTEGER DEFAULT 0;
+
